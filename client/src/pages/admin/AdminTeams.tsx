@@ -284,7 +284,7 @@ export default function AdminTeams() {
       )}
 
       {supOpen && (
-        <Modal title="Add new supervisor" onClose={() => setSupOpen(false)}
+        <Modal title="Enter Supervisor Details" onClose={() => setSupOpen(false)}
           footer={<><button className="btn btn-primary" onClick={createSupervisor} disabled={busy}>{busy ? <Spinner /> : 'Save'}</button><button className="btn btn-ghost" onClick={() => setSupOpen(false)}>Cancel</button></>}>
           <form onSubmit={createSupervisor}>
             <div className="field"><label className="label">Full name *</label><input className="input" value={supForm.full_name} onChange={(e) => setSupForm({ ...supForm, full_name: e.target.value })} required /></div>
