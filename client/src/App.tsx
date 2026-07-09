@@ -12,7 +12,6 @@ import MemberDashboard from './pages/member/MemberDashboard';
 import MemberTasks from './pages/member/MemberTasks';
 import TaskDetail from './pages/member/TaskDetail';
 import MemberReports from './pages/member/MemberReports';
-import WeeklyReport from './pages/member/WeeklyReport';
 import PeerReviews from './pages/member/PeerReviews';
 import TeamHub from './pages/member/TeamHub';
 
@@ -57,7 +56,6 @@ export default function App() {
         <Route path="/tasks/:id" element={<TaskDetail />} />
         <Route path="/team" element={<TeamHub />} />
         <Route path="/reports" element={<MemberReports />} />
-        <Route path="/weekly-report" element={<WeeklyReport />} />
         <Route path="/peer-reviews" element={<PeerReviews />} />
       </>
     ),

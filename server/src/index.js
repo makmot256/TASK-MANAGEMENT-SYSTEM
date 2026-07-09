@@ -17,7 +17,6 @@ import peerRoutes from './routes/peer.routes.js';
 import analyticsRoutes from './routes/analytics.routes.js';
 import notificationsRoutes from './routes/notifications.routes.js';
 import teamRoutes from './routes/team.routes.js';
-import weeklyRoutes from './routes/weekly.routes.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -39,7 +38,6 @@ app.use('/api/peer', peerRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/team', teamRoutes);
-app.use('/api/weekly-reports', weeklyRoutes);
 
 // Serve the built client in production, if present.
 const clientDist = path.resolve(__dirname, '../../client/dist');

@@ -35,3 +35,12 @@ export const IcoFile = (p: P) => <S {...p}><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2
 export const IcoTrash = (p: P) => <S {...p}><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" /></S>;
 export const IcoEdit = (p: P) => <S {...p}><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" /><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" /></S>;
 export const IcoSearch = (p: P) => <S {...p}><circle cx="11" cy="11" r="8" /><path d="M21 21l-4.35-4.35" /></S>;
+export const IcoMonitor = (p: P) => <S {...p}><rect x="2" y="3" width="20" height="14" rx="2" /><path d="M8 21h8M12 17v4" /></S>;
+export const IcoUserCog = (p: P) => (
+  <S {...p}>
+    <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+    <circle cx="9" cy="7" r="4" />
+    <circle cx="19" cy="11" r="2" />
+    <path d="M19 8v1M19 13v1M16.6 9.5l.9.5M20.5 12l.9.5M16.6 12.5l.9-.5M20.5 10l.9-.5" />
+  </S>
+);

@@ -132,7 +132,27 @@ export async function assignPeerReviewersForSubmission(submissionId, revieweeId,
     });
   }
 
-  return { created, skipped: maxReviewers - created, maxReviewers };
+  const reviewers = await getPeerReviewersForSubmission(submissionId);
+  return { created, skipped: maxReviewers - created, maxReviewers, reviewers };
+}
+
+/** Peer reviewers assigned to a submission (for supervisor visibility). */
+export async function getPeerReviewersForSubmission(submissionId) {
+  const [rows] = await pool.query(
+    `SELECT pa.id, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
+            u.id AS reviewer_id, u.full_name AS reviewer_name, u.avatar_color AS reviewer_color,
+            ass.score AS review_score
+       FROM peer_review_assignments pa
+       JOIN users u ON u.id = pa.reviewer_id
+       LEFT JOIN peer_assessments ass
+         ON ass.submission_id = pa.submission_id
+        AND ass.assessor_id = pa.reviewer_id
+        AND ass.kind = 'peer_review'
+      WHERE pa.submission_id = ?
+      ORDER BY pa.assigned_at ASC`,
+    [submissionId]
+  );
+  return rows;
 }
 
 export async function listAssignmentsForScope(memberIds) {
@@ -200,17 +220,25 @@ export async function listAssignmentsForScope(memberIds) {
 export async function memberAssignments(reviewerId) {
   const settings = await getSettings();
   const [rows] = await pool.query(
-    `SELECT pa.id, pa.submission_id, pa.reviewee_id, pa.kind, pa.status, pa.assigned_at, pa.due_at,
+    `SELECT pa.id, pa.submission_id, pa.reviewee_id, pa.kind, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
             u.full_name AS reviewee_name, u.avatar_color AS reviewee_color, u.title AS reviewee_title,
             t.title AS task_title, s.submitted_at AS submission_date,
             (SELECT COUNT(*) FROM submission_files f WHERE f.submission_id = s.id) AS file_count,
-            (s.content IS NOT NULL AND s.content <> '') AS has_content
+            (s.content IS NOT NULL AND s.content <> '') AS has_content,
+            ass.score AS review_score, ass.comment AS review_comment, ass.vulgar_comment AS review_vulgar,
+            ass.created_at AS reviewed_at
        FROM peer_review_assignments pa
        JOIN users u ON u.id = pa.reviewee_id
        JOIN submissions s ON s.id = pa.submission_id
        JOIN tasks t ON t.id = s.task_id
+       LEFT JOIN peer_assessments ass
+         ON ass.submission_id = pa.submission_id
+        AND ass.assessor_id = pa.reviewer_id
+        AND ass.kind = 'peer_review'
       WHERE pa.reviewer_id = ? AND pa.submission_id IS NOT NULL
-      ORDER BY pa.status ASC, pa.assigned_at DESC`,
+      ORDER BY
+        CASE pa.status WHEN 'pending' THEN 0 WHEN 'missed' THEN 1 ELSE 2 END,
+        COALESCE(pa.completed_at, pa.assigned_at) DESC`,
     [reviewerId]
   );
   const pending = rows.filter((r) => r.status === 'pending');

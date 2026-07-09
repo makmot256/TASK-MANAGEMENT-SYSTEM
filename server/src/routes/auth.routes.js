@@ -39,15 +39,14 @@ router.post(
     await logActivity(user.id, 'login', null, ip);
 
     const token = signToken(user);
+    const [[fresh]] = await pool.execute(
+      `SELECT id, full_name, email, role, avatar_color, phone, title, last_login_at, created_at
+       FROM users WHERE id = ?`,
+      [user.id]
+    );
     res.json({
       token,
-      user: {
-        id: user.id,
-        full_name: user.full_name,
-        email: user.email,
-        role: user.role,
-        avatar_color: user.avatar_color,
-      },
+      user: fresh,
     });
   })
 );

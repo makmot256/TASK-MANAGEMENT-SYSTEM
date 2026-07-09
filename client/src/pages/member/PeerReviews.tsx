@@ -22,9 +22,11 @@ export default function PeerReviews() {
   const [mine, setMine] = useState<any>(null);
   const [cohort, setCohort] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  const [assignTab, setAssignTab] = useState<'pending' | 'past' | 'all'>('pending');
   const [target, setTarget] = useState<any>(null);
   const [collabTarget, setCollabTarget] = useState<any>(null);
   const [preview, setPreview] = useState<any>(null);
+  const [viewOnly, setViewOnly] = useState(false);
   const [score, setScore] = useState(0);
   const [comment, setComment] = useState('');
 
@@ -47,13 +49,14 @@ export default function PeerReviews() {
   const hasReviewedSubmission = (submissionId: number) =>
     given.some((x) => x.submission_id === submissionId && x.kind === 'peer_review');
 
-  const openReview = async (assignment: any) => {
+  const openReview = async (assignment: any, readOnly = false) => {
     try {
       const { data } = await api.get(`/submissions/${assignment.submission_id}`);
       setPreview(data);
       setTarget(assignment);
-      setScore(0);
-      setComment('');
+      setViewOnly(readOnly || assignment.status === 'completed');
+      setScore(readOnly || assignment.status === 'completed' ? Number(assignment.review_score) || 0 : 0);
+      setComment(readOnly || assignment.status === 'completed' ? (assignment.review_comment || '') : '');
     } catch (err) {
       toast(errMsg(err), 'error');
     }
@@ -86,8 +89,10 @@ export default function PeerReviews() {
       toast(data.message || 'Peer review submitted.', data.vulgar_comment ? 'error' : 'success');
       setTarget(null);
       setPreview(null);
+      setViewOnly(false);
       setScore(0);
       setComment('');
+      setAssignTab('past');
       load();
     } catch (err) {
       toast(errMsg(err), 'error');
@@ -116,7 +121,10 @@ export default function PeerReviews() {
   const prAvg = mine?.aggregates?.find((a: any) => a.kind === 'peer_review');
   const coAvg = mine?.aggregates?.find((a: any) => a.kind === 'collaboration');
   const pending = assigned.filter((a) => a.status === 'pending');
+  const past = assigned.filter((a) => a.status === 'completed');
   const missed = assigned.filter((a) => a.status === 'missed');
+  const shownAssigned =
+    assignTab === 'pending' ? pending : assignTab === 'past' ? past : assigned.filter((a) => a.status !== 'missed');
   const missedPct = Math.round((penaltyPolicy?.missed_penalty ?? 0.05) * 100);
   const vulgarPct = Math.round((penaltyPolicy?.vulgar_penalty ?? 0.03) * 100);
 
@@ -148,13 +156,38 @@ export default function PeerReviews() {
             </div>
           </div>
 
-          {mine?.comments?.length > 0 && (
+          {(mine?.groups?.length > 0 || mine?.comments?.length > 0) && (
             <div className="card card-pad" style={{ marginTop: 18 }}>
-              <h3 className="card-title" style={{ marginBottom: 12 }}>Anonymous feedback for you</h3>
-              {mine.comments.map((c: any, i: number) => (
-                <div key={i} className="card" style={{ padding: 12, marginBottom: 10 }}>
-                  <span className="badge badge-grey">{c.kind === 'peer_review' ? 'Peer review' : 'Collaboration'}</span>
-                  <p style={{ marginTop: 8, fontSize: 14 }}>{c.comment}</p>
+              <h3 className="card-title" style={{ marginBottom: 14 }}>Anonymous feedback for you</h3>
+              <p className="muted" style={{ fontSize: 13, marginTop: 0, marginBottom: 16 }}>
+                Grouped by the task each peer review relates to. Reviewer names stay hidden.
+              </p>
+              {(mine.groups?.length
+                ? mine.groups
+                : [{
+                    key: 'all',
+                    task_title: 'Feedback',
+                    comments: mine.comments || [],
+                  }]
+              ).map((group: any) => (
+                <div key={group.key} style={{ marginBottom: 18 }}>
+                  <div className="row between wrap" style={{ gap: 8, marginBottom: 10 }}>
+                    <div className="row" style={{ gap: 8, minWidth: 0 }}>
+                      <strong style={{ fontSize: 14 }}>{group.task_title}</strong>
+                      <span className="badge badge-grey">{group.comments.length}</span>
+                    </div>
+                  </div>
+                  {group.comments.map((c: any, i: number) => (
+                    <div key={`${group.key}-${i}`} className="card" style={{ padding: 12, marginBottom: 10 }}>
+                      <div className="row between wrap" style={{ gap: 8 }}>
+                        <span className={`badge ${c.kind === 'peer_review' ? 'badge-brand' : 'badge-grey'}`}>
+                          {c.kind === 'peer_review' ? 'Peer review' : 'Collaboration'}
+                        </span>
+                        {c.score != null && <span className="tiny">{c.score}/5</span>}
+                      </div>
+                      <p style={{ marginTop: 8, fontSize: 14, marginBottom: 0 }}>{c.comment}</p>
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
@@ -170,71 +203,142 @@ export default function PeerReviews() {
           </div>
 
           <div className="card card-pad" style={{ marginTop: 18 }}>
-            <h3 className="card-title" style={{ marginBottom: 14 }}>Assigned report reviews</h3>
-            {pending.length === 0 ? (
-              <EmptyState title="No pending reviews" sub="You'll be notified when a uploaded report is assigned to you for peer review." />
+            <div className="row between wrap" style={{ gap: 10, marginBottom: 14 }}>
+              <h3 className="card-title" style={{ margin: 0 }}>Assigned report reviews</h3>
+              <div className="pill-toggle">
+                <button className={assignTab === 'pending' ? 'active' : ''} onClick={() => setAssignTab('pending')}>
+                  Pending{pending.length ? ` (${pending.length})` : ''}
+                </button>
+                <button className={assignTab === 'past' ? 'active' : ''} onClick={() => setAssignTab('past')}>
+                  Past{past.length ? ` (${past.length})` : ''}
+                </button>
+                <button className={assignTab === 'all' ? 'active' : ''} onClick={() => setAssignTab('all')}>
+                  All
+                </button>
+              </div>
+            </div>
+
+            {shownAssigned.length === 0 ? (
+              <EmptyState
+                title={assignTab === 'past' ? 'No past reviews yet' : assignTab === 'all' ? 'No assigned reviews' : 'No pending reviews'}
+                sub={
+                  assignTab === 'past'
+                    ? 'After you complete a peer review, it will appear here with your score and comment.'
+                    : "You'll be notified when an uploaded report is assigned to you for peer review."
+                }
+              />
+            ) : assignTab === 'past' || (assignTab === 'all' && past.length > 0 && pending.length === 0) ? (
+              <div className="table-scroll">
+                <table className="table">
+                  <thead>
+                    <tr>
+                      <th>Task</th>
+                      <th>Author</th>
+                      <th>Your score</th>
+                      <th>Your comment</th>
+                      <th>Reviewed</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {shownAssigned.filter((a) => a.status === 'completed').map((a) => (
+                      <tr key={a.id}>
+                        <td><strong>{a.task_title}</strong></td>
+                        <td>
+                          <div className="row" style={{ gap: 8 }}>
+                            <Avatar name={a.reviewee_name} color={a.reviewee_color} size="sm" />
+                            <span>{a.reviewee_name}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <strong>{a.review_score != null ? `${a.review_score}/5` : '—'}</strong>
+                          {a.review_vulgar ? <span className="badge badge-red" style={{ marginLeft: 6 }}>Flagged</span> : null}
+                        </td>
+                        <td className="muted" style={{ maxWidth: 280 }}>{a.review_comment || '—'}</td>
+                        <td className="muted">{fmtDateTime(a.reviewed_at || a.completed_at)}</td>
+                        <td>
+                          <button className="btn btn-ghost btn-sm" onClick={() => openReview(a, true)}>View</button>
+                        </td>
+                      </tr>
+                    ))}
+                    {assignTab === 'all' && pending.map((a) => (
+                      <tr key={a.id}>
+                        <td><strong>{a.task_title}</strong></td>
+                        <td>
+                          <div className="row" style={{ gap: 8 }}>
+                            <Avatar name={a.reviewee_name} color={a.reviewee_color} size="sm" />
+                            <span>{a.reviewee_name}</span>
+                          </div>
+                        </td>
+                        <td><span className="badge badge-amber">Pending</span></td>
+                        <td className="muted">—</td>
+                        <td className="muted">{a.due_at ? `Due ${fmtDateTime(a.due_at)}` : '—'}</td>
+                        <td>
+                          <button className="btn btn-primary btn-sm" onClick={() => openReview(a)}>Review</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             ) : (
               <div className="grid grid-2">
-                {pending.map((a) => (
+                {shownAssigned.map((a) => (
                   <div key={a.id} className="card" style={{ padding: 16 }}>
                     <div style={{ fontWeight: 700, fontSize: 15 }}>{a.task_title}</div>
                     <div className="tiny" style={{ marginTop: 4 }}>Submitted {fmtDateTime(a.submission_date)}</div>
-                    {a.due_at && <div className="tiny" style={{ marginTop: 2, color: 'var(--amber)' }}>Due {fmtDateTime(a.due_at)}</div>}
+                    {a.status === 'pending' && a.due_at && (
+                      <div className="tiny" style={{ marginTop: 2, color: 'var(--amber)' }}>Due {fmtDateTime(a.due_at)}</div>
+                    )}
+                    {a.status === 'completed' && (
+                      <div className="tiny" style={{ marginTop: 2 }}>
+                        Reviewed {fmtDateTime(a.reviewed_at || a.completed_at)}
+                        {a.review_score != null ? ` · ${a.review_score}/5` : ''}
+                      </div>
+                    )}
                     <div className="row" style={{ gap: 8, marginTop: 10 }}>
                       <Avatar name={a.reviewee_name} color={a.reviewee_color} size="sm" />
                       <span className="muted" style={{ fontSize: 13 }}>{a.reviewee_name}</span>
                     </div>
-                    <span className="badge badge-amber" style={{ marginTop: 12 }}>Pending review</span>
-                    <button className="btn btn-primary btn-sm btn-block" style={{ marginTop: 12 }} onClick={() => openReview(a)}>
-                      Review report
+                    <span
+                      className={`badge ${a.status === 'completed' ? 'badge-green' : 'badge-amber'}`}
+                      style={{ marginTop: 12 }}
+                    >
+                      {a.status === 'completed' ? 'Completed' : 'Pending review'}
+                    </span>
+                    <button
+                      className={`btn ${a.status === 'completed' ? 'btn-ghost' : 'btn-primary'} btn-sm btn-block`}
+                      style={{ marginTop: 12 }}
+                      onClick={() => openReview(a, a.status === 'completed')}
+                    >
+                      {a.status === 'completed' ? 'View review' : 'Review report'}
                     </button>
                   </div>
                 ))}
               </div>
             )}
+
+            {missed.length > 0 && (
+              <div style={{ marginTop: 18 }}>
+                <h4 className="card-title" style={{ fontSize: 14, marginBottom: 10 }}>Missed reviews (penalized)</h4>
+                <div className="table-scroll">
+                  <table className="table">
+                    <thead><tr><th>Task</th><th>Author</th><th>Was due</th><th>Status</th></tr></thead>
+                    <tbody>
+                      {missed.map((a) => (
+                        <tr key={a.id}>
+                          <td><strong>{a.task_title}</strong></td>
+                          <td>{a.reviewee_name}</td>
+                          <td className="muted">{a.due_at ? fmtDateTime(a.due_at) : '—'}</td>
+                          <td><span className="badge badge-red">Missed — TP penalty</span></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
           </div>
-
-          {missed.length > 0 && (
-            <div className="card card-pad" style={{ marginTop: 18 }}>
-              <h3 className="card-title" style={{ marginBottom: 14 }}>Missed reviews (penalized)</h3>
-              <div className="table-scroll">
-                <table className="table">
-                  <thead><tr><th>Task</th><th>Author</th><th>Was due</th><th>Status</th></tr></thead>
-                  <tbody>
-                    {missed.map((a) => (
-                      <tr key={a.id}>
-                        <td><strong>{a.task_title}</strong></td>
-                        <td>{a.reviewee_name}</td>
-                        <td className="muted">{a.due_at ? fmtDateTime(a.due_at) : '—'}</td>
-                        <td><span className="badge badge-red">Missed — TP penalty</span></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-
-          {assigned.filter((a) => a.status === 'completed').length > 0 && (
-            <div className="card card-pad" style={{ marginTop: 18 }}>
-              <h3 className="card-title" style={{ marginBottom: 14 }}>Completed report reviews</h3>
-              <div className="table-scroll">
-                <table className="table">
-                  <thead><tr><th>Task</th><th>Author</th><th>Submitted</th><th>Status</th></tr></thead>
-                  <tbody>
-                    {assigned.filter((a) => a.status === 'completed').map((a) => (
-                      <tr key={a.id}>
-                        <td><strong>{a.task_title}</strong></td>
-                        <td>{a.reviewee_name}</td>
-                        <td className="muted">{fmtDateTime(a.submission_date)}</td>
-                        <td><span className="badge badge-green">Done</span></td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
 
           <div className="card card-pad" style={{ marginTop: 18 }}>
             <h3 className="card-title" style={{ marginBottom: 8 }}>Collaboration ratings</h3>
@@ -266,19 +370,26 @@ export default function PeerReviews() {
 
       {target && preview && (
         <Modal
-          title={`Peer review: ${target.task_title}`}
-          onClose={() => { setTarget(null); setPreview(null); }}
+          title={`${viewOnly ? 'Your review' : 'Peer review'}: ${target.task_title}`}
+          onClose={() => { setTarget(null); setPreview(null); setViewOnly(false); }}
           wide
           footer={(
             <>
-              <button className="btn btn-primary" onClick={submit} disabled={hasReviewedSubmission(target.submission_id)}>Submit review</button>
-              <button className="btn btn-ghost" onClick={() => { setTarget(null); setPreview(null); }}>Cancel</button>
+              {!viewOnly && (
+                <button className="btn btn-primary" onClick={submit} disabled={hasReviewedSubmission(target.submission_id)}>
+                  Submit review
+                </button>
+              )}
+              <button className="btn btn-ghost" onClick={() => { setTarget(null); setPreview(null); setViewOnly(false); }}>
+                {viewOnly ? 'Close' : 'Cancel'}
+              </button>
             </>
           )}
         >
           <p className="muted" style={{ fontSize: 13, marginBottom: 14 }}>
-            Read the full report and download any attachments before submitting your feedback.
-            {target.reviewee_name} will not see your name.
+            {viewOnly
+              ? 'This is the review you already submitted. The author cannot see your name.'
+              : `Read the full report and download any attachments before submitting your feedback. ${target.reviewee_name} will not see your name.`}
           </p>
 
           <div className="card card-pad" style={{ marginBottom: 16, background: 'var(--surface-2)' }}>
@@ -286,7 +397,7 @@ export default function PeerReviews() {
               <span className="card-title" style={{ fontSize: 14 }}>Submitted report</span>
               <div className="row" style={{ gap: 8 }}>
                 <span className="badge badge-brand">
-                  {preview.submission.kind === 'daily_log' ? 'Daily log' : 'Weekly report'}
+                  {preview.submission.kind === 'daily_log' ? 'Daily log' : 'Task report'}
                 </span>
                 <span className="muted" style={{ fontSize: 13 }}>{fmtDateTime(preview.submission.submitted_at)}</span>
               </div>
@@ -323,13 +434,22 @@ export default function PeerReviews() {
             )}
           </div>
 
-          <div className="field"><label className="label">Score (1-5)</label><Stars value={score} onPick={setScore} /></div>
           <div className="field">
-            <label className="label">Comment (optional)</label>
-            <textarea className="textarea" value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Constructive feedback on the report..." />
-            <p className="tiny muted" style={{ marginTop: 6 }}>
-              Keep language professional. Vulgar or abusive comments reduce your Task Performance score.
-            </p>
+            <label className="label">Score (1-5)</label>
+            <Stars value={score} onPick={viewOnly ? undefined : setScore} />
+          </div>
+          <div className="field">
+            <label className="label">{viewOnly ? 'Your comment' : 'Comment (optional)'}</label>
+            {viewOnly ? (
+              <p style={{ fontSize: 14, margin: 0, whiteSpace: 'pre-wrap' }}>{comment || '—'}</p>
+            ) : (
+              <>
+                <textarea className="textarea" value={comment} onChange={(e) => setComment(e.target.value)} placeholder="Constructive feedback on the report..." />
+                <p className="tiny muted" style={{ marginTop: 6 }}>
+                  Keep language professional. Vulgar or abusive comments reduce your Task Performance score.
+                </p>
+              </>
+            )}
           </div>
         </Modal>
       )}

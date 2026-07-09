@@ -7,7 +7,11 @@ import { asyncHandler, HttpError } from '../middleware/error.js';
 import { upload, uploadRoot } from '../middleware/upload.js';
 import { notify, logActivity } from '../utils/notify.js';
 import { memberIdsForSupervisor } from '../utils/scope.js';
-import { assignPeerReviewersForSubmission, canViewSubmissionForPeerReview } from '../services/peer-assignment.service.js';
+import {
+  assignPeerReviewersForSubmission,
+  canViewSubmissionForPeerReview,
+  getPeerReviewersForSubmission,
+} from '../services/peer-assignment.service.js';
 
 const router = Router();
 router.use(authenticate);
@@ -50,18 +54,36 @@ router.post(
     // Move assignment to Under Review on submission
     await pool.execute(`UPDATE task_assignments SET status = 'Under Review' WHERE id = ?`, [a.id]);
     await logActivity(req.user.id, 'submission', { task_id, submissionId }, null);
+
+    // Assign peer reviewers immediately so supervisors can see them right away.
+    let peerAssign = { created: 0, reviewers: [] };
+    try {
+      peerAssign = await assignPeerReviewersForSubmission(submissionId, req.user.id, a.title);
+    } catch (err) {
+      console.error('[peer-assign] submission assignment failed:', err.message);
+    }
+
+    const reviewerNames = (peerAssign.reviewers || []).map((r) => r.reviewer_name).filter(Boolean);
+    const peerLine =
+      reviewerNames.length > 0
+        ? ` Peer reviewers assigned: ${reviewerNames.join(', ')}.`
+        : peerAssign.created === 0
+          ? ' No peer reviewers were available to assign.'
+          : '';
+
     await notify(a.created_by, {
       type: 'report_submitted',
       title: 'New report submitted',
-      body: `${req.user.full_name} submitted a report for "${a.title}"`,
+      body: `${req.user.full_name} submitted a report for "${a.title}".${peerLine}`,
       link: `/review/${submissionId}`,
     });
 
-    assignPeerReviewersForSubmission(submissionId, req.user.id, a.title).catch((err) => {
-      console.error('[peer-assign] submission assignment failed:', err.message);
+    res.status(201).json({
+      id: submissionId,
+      message: 'Report submitted.',
+      peer_reviewers: peerAssign.reviewers || [],
+      peer_reviewers_assigned: Number(peerAssign.created) || 0,
     });
-
-    res.status(201).json({ id: submissionId, message: 'Report submitted.' });
   })
 );
 
@@ -90,7 +112,7 @@ router.get(
     let ids = null;
     if (req.user.role === 'supervisor') {
       ids = await memberIdsForSupervisor(req.user.id);
-      if (ids.length === 0) return res.json({ submissions: [] });
+      if (ids.length === 0) return res.json({ submissions: [], pending: 0 });
     }
     const where = ids ? `WHERE s.member_id IN (${ids.map(() => '?').join(',')})` : '';
     const [rows] = await pool.query(
@@ -98,12 +120,42 @@ router.get(
               u.full_name AS member_name, u.avatar_color,
               (SELECT COUNT(*) FROM submission_files f WHERE f.submission_id = s.id) AS file_count,
               (SELECT COUNT(*) FROM report_comments c WHERE c.submission_id = s.id AND c.deleted_at IS NULL) AS comment_count,
-              EXISTS(SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id) AS assessed
+              EXISTS(SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id) AS assessed,
+              (SELECT COUNT(*) FROM peer_review_assignments pa WHERE pa.submission_id = s.id) AS peer_reviewer_count,
+              (SELECT COUNT(*) FROM peer_review_assignments pa WHERE pa.submission_id = s.id AND pa.status = 'completed') AS peer_completed_count
        FROM submissions s JOIN tasks t ON t.id = s.task_id JOIN users u ON u.id = s.member_id
        ${where} ORDER BY s.submitted_at DESC LIMIT 200`,
       ids || []
     );
-    res.json({ submissions: rows });
+
+    // Attach assigned peer reviewers so supervisors see them immediately in the queue.
+    for (const row of rows) {
+      row.peer_reviewers = await getPeerReviewersForSubmission(row.id);
+    }
+
+    const pending = rows.filter((r) => !r.assessed).length;
+    res.json({ submissions: rows, pending });
+  })
+);
+
+// GET /api/submissions/review-pending-count  (nav badge)
+router.get(
+  '/review-pending-count',
+  requireRole('supervisor', 'admin'),
+  asyncHandler(async (req, res) => {
+    let ids = null;
+    if (req.user.role === 'supervisor') {
+      ids = await memberIdsForSupervisor(req.user.id);
+      if (ids.length === 0) return res.json({ pending: 0 });
+    }
+    const where = ids
+      ? `WHERE s.member_id IN (${ids.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id)`
+      : `WHERE NOT EXISTS (SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id)`;
+    const [[row]] = await pool.query(
+      `SELECT COUNT(*) AS pending FROM submissions s ${where}`,
+      ids || []
+    );
+    res.json({ pending: Number(row.pending) || 0 });
   })
 );
 
@@ -142,7 +194,20 @@ router.get(
       `SELECT quality_score, responsiveness_score, created_at FROM supervisor_assessments WHERE submission_id = ? ORDER BY created_at DESC LIMIT 1`,
       [req.params.id]
     );
-    res.json({ submission: sub, files, comments, assessment: assessment[0] || null });
+
+    // Supervisors/admins see who was assigned to peer-review this submission.
+    let peer_reviewers = [];
+    if (req.user.role === 'supervisor' || req.user.role === 'admin') {
+      peer_reviewers = await getPeerReviewersForSubmission(req.params.id);
+    }
+
+    res.json({
+      submission: sub,
+      files,
+      comments,
+      assessment: assessment[0] || null,
+      peer_reviewers,
+    });
   })
 );
 

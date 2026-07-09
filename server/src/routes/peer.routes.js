@@ -97,11 +97,46 @@ router.get(
       [req.user.id]
     );
     const [comments] = await pool.execute(
-      `SELECT kind, comment, created_at FROM peer_assessments
-       WHERE assessee_id = ? AND comment IS NOT NULL AND comment <> '' ORDER BY created_at DESC`,
+      `SELECT pa.kind, pa.score, pa.comment, pa.created_at, pa.submission_id,
+              t.id AS task_id, t.title AS task_title
+         FROM peer_assessments pa
+         LEFT JOIN submissions s ON s.id = pa.submission_id
+         LEFT JOIN tasks t ON t.id = s.task_id
+        WHERE pa.assessee_id = ?
+          AND pa.comment IS NOT NULL
+          AND pa.comment <> ''
+        ORDER BY
+          CASE WHEN t.id IS NULL THEN 1 ELSE 0 END,
+          t.title ASC,
+          pa.created_at DESC`,
       [req.user.id]
     );
-    res.json({ aggregates: agg, comments });
+
+    const groupsMap = new Map();
+    for (const c of comments) {
+      const key = c.task_id
+        ? `task-${c.task_id}`
+        : c.kind === 'collaboration'
+          ? 'collaboration'
+          : 'general';
+      if (!groupsMap.has(key)) {
+        groupsMap.set(key, {
+          key,
+          task_id: c.task_id || null,
+          task_title: c.task_title
+            || (c.kind === 'collaboration' ? 'Collaboration feedback' : 'General feedback'),
+          comments: [],
+        });
+      }
+      groupsMap.get(key).comments.push({
+        kind: c.kind,
+        score: c.score,
+        comment: c.comment,
+        created_at: c.created_at,
+      });
+    }
+
+    res.json({ aggregates: agg, comments, groups: [...groupsMap.values()] });
   })
 );
 
@@ -111,7 +146,15 @@ router.get(
   requireRole('member'),
   asyncHandler(async (req, res) => {
     const [rows] = await pool.execute(
-      `SELECT assessee_id, submission_id, kind FROM peer_assessments WHERE assessor_id = ?`,
+      `SELECT pa.assessee_id, pa.submission_id, pa.kind, pa.score, pa.comment, pa.vulgar_comment, pa.created_at,
+              u.full_name AS assessee_name, u.avatar_color AS assessee_color,
+              t.title AS task_title
+         FROM peer_assessments pa
+         JOIN users u ON u.id = pa.assessee_id
+         LEFT JOIN submissions s ON s.id = pa.submission_id
+         LEFT JOIN tasks t ON t.id = s.task_id
+        WHERE pa.assessor_id = ?
+        ORDER BY pa.created_at DESC`,
       [req.user.id]
     );
     res.json({ given: rows });

@@ -65,15 +65,79 @@ export default function ReviewDetail() {
     } catch (err) { toast(errMsg(err), 'error'); } finally { setBusy(false); }
   };
 
+  const peerReviewers = data.peer_reviewers || [];
+
   return (
     <div className="page">
       <a onClick={() => nav('/review')} style={{ cursor: 'pointer', fontSize: 14 }}>← Back to review queue</a>
       <div className="row" style={{ gap: 12, marginTop: 12 }}>
         <Avatar name={s.member_name} color={s.avatar_color} />
-        <div><h1 className="page-title" style={{ fontSize: 22 }}>{s.task_title}</h1><p className="muted" style={{ fontSize: 14 }}>{s.member_name} · {fmtDateTime(s.submitted_at)} {s.is_late ? <span className="badge badge-red">Late</span> : <span className="badge badge-green">On time</span>}</p></div>
+        <div>
+          <h1 className="page-title" style={{ fontSize: 22 }}>{s.task_title}</h1>
+          <p className="muted" style={{ fontSize: 14 }}>
+            {s.member_name} · {fmtDateTime(s.submitted_at)}{' '}
+            {s.is_late ? <span className="badge badge-red">Late</span> : <span className="badge badge-green">On time</span>}
+          </p>
+        </div>
       </div>
 
-      <div className="grid responsive-split" style={{ gridTemplateColumns: '1.5fr 1fr', marginTop: 20 }}>
+      <div className="card card-pad" style={{ marginTop: 18 }}>
+        <div className="row between wrap" style={{ gap: 10, marginBottom: 12 }}>
+          <div>
+            <h3 className="card-title" style={{ margin: 0 }}>Assigned peer reviewers</h3>
+            <p className="tiny" style={{ marginTop: 4, marginBottom: 0 }}>
+              Assigned automatically when this report was uploaded. Visible to supervisors only.
+            </p>
+          </div>
+          <span className="badge badge-brand">
+            {peerReviewers.length} assigned
+            {peerReviewers.filter((r: any) => r.status === 'completed').length
+              ? ` · ${peerReviewers.filter((r: any) => r.status === 'completed').length} done`
+              : ''}
+          </span>
+        </div>
+
+        {peerReviewers.length === 0 ? (
+          <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+            No peer reviewers were assigned for this submission yet.
+          </p>
+        ) : (
+          <div className="grid grid-3" style={{ gap: 12 }}>
+            {peerReviewers.map((r: any) => (
+              <div key={r.id || r.reviewer_id} className="card" style={{ padding: 14 }}>
+                <div className="row between" style={{ gap: 10 }}>
+                  <div className="row" style={{ gap: 10, minWidth: 0 }}>
+                    <Avatar name={r.reviewer_name} color={r.reviewer_color} size="sm" />
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 700, fontSize: 14 }}>{r.reviewer_name}</div>
+                      <div className="tiny" style={{ marginTop: 2 }}>
+                        {r.status === 'completed' && r.review_score != null
+                          ? `Scored ${r.review_score}/5`
+                          : r.due_at
+                            ? `Due ${fmtDateTime(r.due_at)}`
+                            : `Assigned ${fmtDateTime(r.assigned_at)}`}
+                      </div>
+                    </div>
+                  </div>
+                  <span
+                    className={`badge ${
+                      r.status === 'completed'
+                        ? 'badge-green'
+                        : r.status === 'missed'
+                          ? 'badge-red'
+                          : 'badge-amber'
+                    }`}
+                  >
+                    {r.status}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="grid responsive-split" style={{ gridTemplateColumns: '1.5fr 1fr', marginTop: 18 }}>
         <div style={{ display: 'grid', gap: 18 }}>
           <div className="card card-pad">
             <h3 className="card-title" style={{ marginBottom: 12 }}>Report content</h3>

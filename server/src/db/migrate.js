@@ -59,42 +59,9 @@ async function run() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
-  console.log('  - Ensuring weekly_reports tables');
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS weekly_reports (
-      id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-      member_id           BIGINT UNSIGNED NOT NULL,
-      week_ending         DATE            NOT NULL,
-      tasks_completed     TEXT            NULL,
-      tasks_in_progress   TEXT            NULL,
-      next_week_tasks     TEXT            NULL,
-      problems_challenges TEXT            NULL,
-      supervisor_comment  TEXT            NULL,
-      supervisor_id       BIGINT UNSIGNED NULL,
-      commented_at        DATETIME        NULL,
-      submitted_at        DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      UNIQUE KEY uq_weekly_member_week (member_id, week_ending),
-      KEY idx_weekly_week (week_ending),
-      CONSTRAINT fk_weekly_member     FOREIGN KEY (member_id)     REFERENCES users (id) ON DELETE CASCADE,
-      CONSTRAINT fk_weekly_supervisor FOREIGN KEY (supervisor_id) REFERENCES users (id) ON DELETE SET NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS weekly_report_files (
-      id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-      report_id     BIGINT UNSIGNED NOT NULL,
-      original_name VARCHAR(255)    NOT NULL,
-      stored_name   VARCHAR(255)    NOT NULL,
-      mime_type     VARCHAR(120)    NOT NULL,
-      size_bytes    BIGINT UNSIGNED NOT NULL DEFAULT 0,
-      uploaded_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      PRIMARY KEY (id),
-      KEY idx_wfile_report (report_id),
-      CONSTRAINT fk_wfile_report FOREIGN KEY (report_id) REFERENCES weekly_reports (id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-  `);
+  console.log('  - Removing weekly_reports feature tables (if present)');
+  await pool.query(`DROP TABLE IF EXISTS weekly_report_files`);
+  await pool.query(`DROP TABLE IF EXISTS weekly_reports`);
 
   console.log('  - Ensuring submission-based peer_review_assignments table');
   if (!(await columnExists('peer_review_assignments', 'submission_id'))) {

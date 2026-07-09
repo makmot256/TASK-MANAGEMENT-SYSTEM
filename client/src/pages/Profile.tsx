@@ -29,8 +29,8 @@ export default function Profile() {
 
   return (
     <div className="page">
-      <h1 className="page-title">Profile</h1>
-      <p className="page-sub">Manage your account and security.</p>
+      <h1 className="page-title">Edit profile</h1>
+      <p className="page-sub">Manage your account details and security.</p>
 
       <div className="grid grid-2" style={{ marginTop: 22 }}>
         <div className="card card-pad">

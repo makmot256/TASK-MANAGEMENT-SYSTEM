@@ -43,7 +43,7 @@ export default function MemberReports() {
               {subs.map((s) => (
                 <tr key={s.id}>
                   <td style={{ fontWeight: 600 }}>{s.task_title}</td>
-                  <td><span className="badge badge-brand">{s.kind === 'daily_log' ? 'Daily log' : 'Weekly report'}</span></td>
+                  <td><span className="badge badge-brand">{s.kind === 'daily_log' ? 'Daily log' : 'Task report'}</span></td>
                   <td className="muted">{fmtDateTime(s.submitted_at)}</td>
                   <td>{s.is_late ? <span className="badge badge-red">Late</span> : <span className="badge badge-green">On time</span>}</td>
                   <td>{s.comment_count > 0 ? <span className="badge badge-accent">{s.comment_count} comment(s)</span> : <span className="tiny">—</span>}</td>
@@ -58,7 +58,7 @@ export default function MemberReports() {
       {open && (
         <Modal title={open.submission.task_title} onClose={() => setOpen(null)} wide>
           <div className="row" style={{ gap: 8, marginBottom: 14 }}>
-            <span className="badge badge-brand">{open.submission.kind === 'daily_log' ? 'Daily log' : 'Weekly report'}</span>
+            <span className="badge badge-brand">{open.submission.kind === 'daily_log' ? 'Daily log' : 'Task report'}</span>
             <span className="muted" style={{ fontSize: 13 }}>{fmtDateTime(open.submission.submitted_at)}</span>
           </div>
           {open.submission.content && <p style={{ lineHeight: 1.6, whiteSpace: 'pre-wrap' }}>{open.submission.content}</p>}
