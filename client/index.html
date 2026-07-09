@@ -3,10 +3,37 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="Task Management System - assign tasks, track progress, submit reports, monitor performance." />
-    <title>Task Management System</title>
+    <meta name="description" content="TASK MANAGEMENT SYSTEM — assign tasks, track progress, submit reports, monitor performance." />
+    <title>TASK MANAGEMENT SYSTEM</title>
+    <style>
+      #app-splash {
+        position: fixed; inset: 0; z-index: 9999;
+        display: grid; place-items: center;
+        background: #0b1120; color: #e8edf7;
+        font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      }
+      #app-splash .mark {
+        width: 64px; height: 64px; border-radius: 18px;
+        background: linear-gradient(145deg, #5b8bff, #2453d6 55%, #f4793b);
+        display: grid; place-items: center;
+        font-weight: 800; font-size: 28px; color: #fff;
+        box-shadow: 0 12px 32px rgba(36, 83, 214, 0.45);
+        margin: 0 auto;
+      }
+      #app-splash .name {
+        margin-top: 14px; font-weight: 700; letter-spacing: 0.06em;
+        text-transform: uppercase; font-size: 12px; opacity: 0.85;
+        text-align: center; max-width: 220px; line-height: 1.35;
+      }
+    </style>
   </head>
   <body>
+    <div id="app-splash" aria-hidden="true">
+      <div>
+        <div class="mark">T</div>
+        <div class="name">TASK MANAGEMENT SYSTEM</div>
+      </div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

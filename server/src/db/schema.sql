@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS users (
   phone         VARCHAR(40)     NULL,
   title         VARCHAR(120)    NULL,
   avatar_color  VARCHAR(9)      NOT NULL DEFAULT '#2563eb',
+  avatar_url    VARCHAR(255)    NULL,
   status        ENUM('active','inactive','pending') NOT NULL DEFAULT 'active',
   must_reset    TINYINT(1)      NOT NULL DEFAULT 0,
   created_by    BIGINT UNSIGNED NULL,

@@ -4,8 +4,25 @@ import { IcoX } from '../lib/icons';
 export const initials = (name = '') =>
   name.split(' ').map((p) => p[0]).slice(0, 2).join('').toUpperCase();
 
-export function Avatar({ name, color, size = 'md' }: { name: string; color?: string; size?: 'sm' | 'md' | 'lg' }) {
+export function Avatar({
+  name,
+  color,
+  src,
+  size = 'md',
+}: {
+  name: string;
+  color?: string;
+  src?: string | null;
+  size?: 'sm' | 'md' | 'lg';
+}) {
   const cls = size === 'sm' ? 'avatar avatar-sm' : size === 'lg' ? 'avatar avatar-lg' : 'avatar';
+  if (src) {
+    return (
+      <span className={`${cls} avatar-img`} style={{ background: color || '#2563eb' }}>
+        <img src={src} alt={name} />
+      </span>
+    );
+  }
   return <span className={cls} style={{ background: color || '#2563eb' }}>{initials(name)}</span>;
 }
 

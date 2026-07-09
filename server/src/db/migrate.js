@@ -163,6 +163,13 @@ async function run() {
     await pool.query(`ALTER TABLE teams DROP COLUMN supervisor_id`);
   }
 
+  if (!(await columnExists('users', 'avatar_url'))) {
+    console.log('  - Adding users.avatar_url');
+    await pool.query(`ALTER TABLE users ADD COLUMN avatar_url VARCHAR(255) NULL AFTER avatar_color`);
+  } else {
+    console.log('  - users.avatar_url already present');
+  }
+
   console.log('> Migrations complete.');
   await pool.end();
 }

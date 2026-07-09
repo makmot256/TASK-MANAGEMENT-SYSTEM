@@ -131,10 +131,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
         <div className="sidebar-inner">
           <div className="brand-logo">
             <div className="brand-mark">T</div>
-            <div>
-              <div className="brand-name">TaskFlow</div>
-              <div className="tiny brand-sub">Management System</div>
-            </div>
+            <div className="brand-name">TASK MANAGEMENT SYSTEM</div>
           </div>
           <nav className="nav">
             <div className="nav-section">{ROLE_LABEL[user.role]} Menu</div>
@@ -156,7 +153,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
             <div className="nav-item" onClick={logout}><IcoLogout className="nav-ico" /> Sign out</div>
           </nav>
           <div className="sidebar-user row">
-            <Avatar name={user.full_name} color={user.avatar_color} size="sm" />
+            <Avatar name={user.full_name} color={user.avatar_color} src={user.avatar_url} size="sm" />
             <div style={{ minWidth: 0 }}>
               <div className="sidebar-user-name">{user.full_name}</div>
               <div className="tiny sidebar-user-email">{user.email}</div>
@@ -209,7 +206,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 aria-haspopup="menu"
                 aria-expanded={profileOpen}
               >
-                <Avatar name={user.full_name} color={user.avatar_color} size="sm" />
+                <Avatar name={user.full_name} color={user.avatar_color} src={user.avatar_url} size="sm" />
               </button>
 
               {profileOpen && (
@@ -220,7 +217,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                   </div>
                   <div className="profile-menu-inner">
                     <div className="profile-menu-head">
-                      <Avatar name={user.full_name} color={user.avatar_color} size="sm" />
+                      <Avatar name={user.full_name} color={user.avatar_color} src={user.avatar_url} size="sm" />
                       <div style={{ minWidth: 0 }}>
                         <div className="profile-menu-name">{user.full_name}</div>
                         <div className="tiny profile-menu-meta">
@@ -267,7 +264,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                       </button>
                     </div>
 
-                    <div className="profile-menu-foot">TaskFlow · v1.0.0</div>
+                    <div className="profile-menu-foot">TASK MANAGEMENT SYSTEM · v1.0.0</div>
                   </div>
                 </div>
               )}

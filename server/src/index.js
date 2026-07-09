@@ -7,6 +7,7 @@ import { env } from './config/env.js';
 import { pool } from './config/db.js';
 import { notFound, errorHandler } from './middleware/error.js';
 import { startScheduler } from './jobs/scheduler.js';
+import { uploadRoot } from './middleware/upload.js';
 
 import authRoutes from './routes/auth.routes.js';
 import adminRoutes from './routes/admin.routes.js';
@@ -27,6 +28,9 @@ app.use(express.urlencoded({ extended: true }));
 
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
+
+// Uploaded files (avatars, submission attachments)
+app.use('/uploads', express.static(uploadRoot));
 
 // API modules
 app.use('/api/auth', authRoutes);

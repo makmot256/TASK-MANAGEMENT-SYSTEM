@@ -2,9 +2,7 @@ import React from 'react';
 import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
 import Layout from './components/Layout';
-import { Spinner } from './components/ui';
-
-import Login from './pages/Login';
+import OnboardingFlow from './pages/auth/OnboardingFlow';
 import ResetPassword from './pages/ResetPassword';
 import Profile from './pages/Profile';
 
@@ -29,21 +27,15 @@ import AdminTeams from './pages/admin/AdminTeams';
 import AdminSettings from './pages/admin/AdminSettings';
 import AdminAudit from './pages/admin/AdminAudit';
 
-function FullScreen({ children }: { children: React.ReactNode }) {
-  return <div style={{ display: 'grid', placeItems: 'center', minHeight: '100vh' }}>{children}</div>;
-}
-
 export default function App() {
-  const { user, loading } = useAuth();
+  const { user } = useAuth();
 
-  if (loading) return <FullScreen><Spinner /></FullScreen>;
-
-  if (!user) {
+  // Password reset is a deep link — skip the splash/auth carousel.
+  if (!user && window.location.pathname.startsWith('/reset-password')) {
     return (
       <Routes>
-        <Route path="/login" element={<Login />} />
         <Route path="/reset-password" element={<ResetPassword />} />
-        <Route path="*" element={<Navigate to="/login" replace />} />
+        <Route path="*" element={<Navigate to="/reset-password" replace />} />
       </Routes>
     );
   }
@@ -82,12 +74,21 @@ export default function App() {
   };
 
   return (
-    <Layout>
-      <Routes>
-        {routesByRole[user.role]}
-        <Route path="/profile" element={<Profile />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
-    </Layout>
+    <OnboardingFlow>
+      {user ? (
+        <Layout>
+          <Routes>
+            {routesByRole[user.role]}
+            <Route path="/profile" element={<Profile />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </Layout>
+      ) : (
+        <Routes>
+          <Route path="/reset-password" element={<ResetPassword />} />
+          <Route path="*" element={<div />} />
+        </Routes>
+      )}
+    </OnboardingFlow>
   );
 }

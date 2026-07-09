@@ -32,4 +32,18 @@ export const upload = multer({
   },
 });
 
+const IMAGE_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+export const avatarUpload = multer({
+  storage,
+  limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+  fileFilter: (req, file, cb) => {
+    if (IMAGE_TYPES.has(file.mimetype) || /\.(jpe?g|png|webp|gif)$/i.test(file.originalname)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Unsupported image type. Use JPG, PNG, WEBP, or GIF.'));
+    }
+  },
+});
+
 export { uploadRoot };

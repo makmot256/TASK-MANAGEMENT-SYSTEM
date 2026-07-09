@@ -6,6 +6,7 @@ export interface User {
   email: string;
   role: Role;
   avatar_color: string;
+  avatar_url?: string | null;
   phone?: string;
   title?: string;
   status?: string;

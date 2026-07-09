@@ -1,4 +1,4 @@
-# TaskFlow — Task Management System
+# TASK MANAGEMENT SYSTEM
 
 A complete, role-based **Task Management System** built from the project SRS. It lets supervisors
 assign tasks, members track progress and submit reports, and supervisors review work, leave feedback,

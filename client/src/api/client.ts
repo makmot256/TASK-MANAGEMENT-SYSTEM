@@ -23,7 +23,7 @@ api.interceptors.response.use(
     }
     if (err.response?.status === 401 && !err.config?.url?.includes('/auth/login')) {
       localStorage.removeItem('tms_token');
-      if (!location.pathname.startsWith('/login')) location.href = '/login';
+      if (!location.pathname.startsWith('/reset-password')) location.href = '/';
     }
     return Promise.reject(err);
   }
