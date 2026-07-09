@@ -143,7 +143,7 @@ export default function Layout({ children }: { children: React.ReactNode }) {
                 {it.icon}
                 <span className="nav-item-label">{it.label}</span>
                 {it.badgeKey === 'reviewQueue' && reviewPending > 0 && (
-                  <span className="nav-count" aria-label={`${reviewPending} pending reviews`}>
+                  <span className="nav-count" aria-label={`${reviewPending} items need review`}>
                     {reviewPending > 99 ? '99+' : reviewPending}
                   </span>
                 )}

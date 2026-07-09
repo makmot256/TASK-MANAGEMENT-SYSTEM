@@ -104,6 +104,15 @@ router.get(
   })
 );
 
+function classifyQueueStatus(row) {
+  // New: fresh upload awaiting first supervisor decision.
+  if (!row.assessed) return 'new';
+  // Pending: reviewed but not fully approved (revision requested) and still open.
+  if (row.revision_requested_at && row.assignment_status !== 'Completed') return 'pending';
+  // Completed: approved / fully done — goes straight here after approve.
+  return 'completed';
+}
+
 // GET /api/submissions/review  (supervisor review queue) -- SRS UC5
 router.get(
   '/review',
@@ -112,29 +121,54 @@ router.get(
     let ids = null;
     if (req.user.role === 'supervisor') {
       ids = await memberIdsForSupervisor(req.user.id);
-      if (ids.length === 0) return res.json({ submissions: [], pending: 0 });
+      if (ids.length === 0) {
+        return res.json({
+          submissions: [],
+          counts: { all: 0, new: 0, pending: 0, completed: 0 },
+          pending: 0,
+        });
+      }
     }
     const where = ids ? `WHERE s.member_id IN (${ids.map(() => '?').join(',')})` : '';
     const [rows] = await pool.query(
-      `SELECT s.id, s.kind, s.is_late, s.submitted_at, t.title AS task_title,
+      `SELECT s.id, s.kind, s.is_late, s.submitted_at, s.revision_requested_at, s.revision_of,
+              t.title AS task_title, ta.status AS assignment_status,
               u.full_name AS member_name, u.avatar_color,
               (SELECT COUNT(*) FROM submission_files f WHERE f.submission_id = s.id) AS file_count,
               (SELECT COUNT(*) FROM report_comments c WHERE c.submission_id = s.id AND c.deleted_at IS NULL) AS comment_count,
               EXISTS(SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id) AS assessed,
               (SELECT COUNT(*) FROM peer_review_assignments pa WHERE pa.submission_id = s.id) AS peer_reviewer_count,
               (SELECT COUNT(*) FROM peer_review_assignments pa WHERE pa.submission_id = s.id AND pa.status = 'completed') AS peer_completed_count
-       FROM submissions s JOIN tasks t ON t.id = s.task_id JOIN users u ON u.id = s.member_id
-       ${where} ORDER BY s.submitted_at DESC LIMIT 200`,
+       FROM submissions s
+       JOIN tasks t ON t.id = s.task_id
+       JOIN task_assignments ta ON ta.id = s.assignment_id
+       JOIN users u ON u.id = s.member_id
+       ${where}
+       ORDER BY
+         CASE
+           WHEN NOT EXISTS(SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id) THEN 0
+           WHEN s.revision_requested_at IS NOT NULL AND ta.status <> 'Completed' THEN 1
+           ELSE 2
+         END,
+         COALESCE(s.revision_requested_at, s.submitted_at) DESC
+       LIMIT 200`,
       ids || []
     );
 
-    // Attach assigned peer reviewers so supervisors see them immediately in the queue.
     for (const row of rows) {
+      row.queue_status = classifyQueueStatus(row);
       row.peer_reviewers = await getPeerReviewersForSubmission(row.id);
     }
 
-    const pending = rows.filter((r) => !r.assessed).length;
-    res.json({ submissions: rows, pending });
+    const counts = {
+      all: rows.length,
+      new: rows.filter((r) => r.queue_status === 'new').length,
+      pending: rows.filter((r) => r.queue_status === 'pending').length,
+      completed: rows.filter((r) => r.queue_status === 'completed').length,
+    };
+    // Nav / page badge: items that still need supervisor attention.
+    const pending = counts.new + counts.pending;
+    res.json({ submissions: rows, counts, pending });
   })
 );
 
@@ -146,16 +180,31 @@ router.get(
     let ids = null;
     if (req.user.role === 'supervisor') {
       ids = await memberIdsForSupervisor(req.user.id);
-      if (ids.length === 0) return res.json({ pending: 0 });
+      if (ids.length === 0) return res.json({ pending: 0, new: 0, awaiting: 0 });
     }
-    const where = ids
-      ? `WHERE s.member_id IN (${ids.map(() => '?').join(',')}) AND NOT EXISTS (SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id)`
-      : `WHERE NOT EXISTS (SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id)`;
+    const scope = ids ? `AND s.member_id IN (${ids.map(() => '?').join(',')})` : '';
     const [[row]] = await pool.query(
-      `SELECT COUNT(*) AS pending FROM submissions s ${where}`,
+      `SELECT
+         SUM(CASE WHEN NOT EXISTS (
+               SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id
+             ) THEN 1 ELSE 0 END) AS new_count,
+         SUM(CASE WHEN s.revision_requested_at IS NOT NULL
+                   AND ta.status <> 'Completed'
+                   AND EXISTS (
+                     SELECT 1 FROM supervisor_assessments sa WHERE sa.submission_id = s.id
+                   ) THEN 1 ELSE 0 END) AS pending_count
+       FROM submissions s
+       JOIN task_assignments ta ON ta.id = s.assignment_id
+       WHERE 1=1 ${scope}`,
       ids || []
     );
-    res.json({ pending: Number(row.pending) || 0 });
+    const newCount = Number(row?.new_count) || 0;
+    const pendingCount = Number(row?.pending_count) || 0;
+    res.json({
+      new: newCount,
+      awaiting: pendingCount,
+      pending: newCount + pendingCount,
+    });
   })
 );
 
