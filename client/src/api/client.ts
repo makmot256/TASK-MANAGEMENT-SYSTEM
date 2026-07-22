@@ -11,17 +11,22 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (res) => res,
   async (err) => {
-    const config = err.config;
+    const config = err.config as (typeof err.config & { __retry?: boolean; __retryCount?: number }) | undefined;
+    const status = err.response?.status;
     const networkErr = !err.response && (
-      err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' || err.message === 'Network Error'
+      err.code === 'ECONNRESET' || err.code === 'ECONNREFUSED' || err.code === 'ECONNABORTED' || err.message === 'Network Error'
     );
-    // Retry once when the API restarts (node --watch) mid-request.
-    if (config && !config.__retry && networkErr) {
+    // Vite proxy returns 502/503/504 while the API restarts (node --watch).
+    const gatewayErr = status === 502 || status === 503 || status === 504;
+    const retries = config?.__retryCount ?? 0;
+
+    if (config && retries < 2 && (networkErr || gatewayErr)) {
+      config.__retryCount = retries + 1;
       config.__retry = true;
-      await new Promise((r) => setTimeout(r, 1500));
+      await new Promise((r) => setTimeout(r, 800 + retries * 700));
       return api(config);
     }
-    if (err.response?.status === 401 && !err.config?.url?.includes('/auth/login')) {
+    if (status === 401 && !config?.url?.includes('/auth/login')) {
       localStorage.removeItem('tms_token');
       if (!location.pathname.startsWith('/reset-password')) location.href = '/';
     }
@@ -29,7 +34,18 @@ api.interceptors.response.use(
   }
 );
 
-export const errMsg = (e: any) => e?.response?.data?.message || e?.message || 'Something went wrong.';
+export const errMsg = (e: any) => {
+  const status = e?.response?.status;
+  const serverMsg = e?.response?.data?.message;
+  if (serverMsg) return serverMsg;
+  if (status === 502 || status === 503 || status === 504) {
+    return 'Server or database is starting up — please try again in a moment.';
+  }
+  if (!e?.response && (e?.code === 'ECONNREFUSED' || e?.message === 'Network Error')) {
+    return 'Cannot reach the server. Make sure the app is running (npm run dev).';
+  }
+  return e?.message || 'Request failed. Please try again.';
+};
 
 // Downloads a protected file through the authenticated API client, then saves it
 // to disk. A plain <a href> cannot be used because it won't send the JWT header.

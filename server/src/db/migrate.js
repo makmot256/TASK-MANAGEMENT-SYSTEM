@@ -170,6 +170,22 @@ async function run() {
     console.log('  - users.avatar_url already present');
   }
 
+  console.log('  - Ensuring task_files table');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS task_files (
+      id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      task_id       BIGINT UNSIGNED NOT NULL,
+      original_name VARCHAR(255)    NOT NULL,
+      stored_name   VARCHAR(255)    NOT NULL,
+      mime_type     VARCHAR(120)    NOT NULL,
+      size_bytes    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      uploaded_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_tfile_task (task_id),
+      CONSTRAINT fk_tfile_task FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
   console.log('> Migrations complete.');
   await pool.end();
 }

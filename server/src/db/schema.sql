@@ -136,6 +136,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   CONSTRAINT fk_task_team    FOREIGN KEY (team_id)    REFERENCES teams (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Briefing documents attached by supervisor when creating/assigning a task
+CREATE TABLE IF NOT EXISTS task_files (
+  id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  task_id       BIGINT UNSIGNED NOT NULL,
+  original_name VARCHAR(255)    NOT NULL,
+  stored_name   VARCHAR(255)    NOT NULL,
+  mime_type     VARCHAR(120)    NOT NULL,
+  size_bytes    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  uploaded_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  KEY idx_tfile_task (task_id),
+  CONSTRAINT fk_tfile_task FOREIGN KEY (task_id) REFERENCES tasks (id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- Optional checklist breakdown of a task (sub-tasks)
 CREATE TABLE IF NOT EXISTS subtasks (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,

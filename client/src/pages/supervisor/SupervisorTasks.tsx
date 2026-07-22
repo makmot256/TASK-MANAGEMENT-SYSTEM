@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react';
-import { api, errMsg } from '../../api/client';
+import { api, errMsg, downloadFile } from '../../api/client';
 import { useToast } from '../../context/ToastContext';
 import { Modal, Avatar, PriorityBadge, StatusBadge, fmtDate, fmtDateTime, Loader, EmptyState, Spinner } from '../../components/ui';
-import { IcoPlus, IcoTasks, IcoTrash } from '../../lib/icons';
+import { IcoPlus, IcoTasks, IcoTrash, IcoUpload, IcoFile } from '../../lib/icons';
 
 const emptyForm = {
   title: '',
@@ -14,16 +14,21 @@ const emptyForm = {
   subtasks: '',
 };
 
+const MAX_BYTES = 1024 * 1024 * 1024; // 1 GB
+const fmtSize = (b: number) =>
+  b < 1024 * 1024 ? `${Math.max(1, Math.round(b / 1024))} KB` : `${(b / 1024 / 1024).toFixed(1)} MB`;
+
 export default function SupervisorTasks() {
   const toast = useToast();
   const [tasks, setTasks] = useState<any[]>([]);
   const [members, setMembers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [createOpen, setCreateOpen] = useState(false);
-  const [detail, setDetail] = useState<{ task: any; assignments: any[]; subtasks: any[] } | null>(null);
+  const [detail, setDetail] = useState<{ task: any; assignments: any[]; subtasks: any[]; files?: any[] } | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [form, setForm] = useState<any>({ ...emptyForm });
+  const [attachFiles, setAttachFiles] = useState<File[]>([]);
 
   const load = async () => {
     const [t, m] = await Promise.all([api.get('/tasks'), api.get('/users/members')]);
@@ -41,7 +46,20 @@ export default function SupervisorTasks() {
 
   const openCreate = () => {
     setForm({ ...emptyForm });
+    setAttachFiles([]);
     setCreateOpen(true);
+  };
+
+  const addFiles = (list: FileList | null) => {
+    if (!list) return;
+    const incoming = Array.from(list);
+    const tooBig = incoming.find((f) => f.size > MAX_BYTES);
+    if (tooBig) toast(`"${tooBig.name}" exceeds the 1 GB limit.`, 'error');
+    const ok = incoming.filter((f) => f.size <= MAX_BYTES);
+    setAttachFiles((prev) => {
+      const names = new Set(prev.map((f) => f.name + f.size));
+      return [...prev, ...ok.filter((f) => !names.has(f.name + f.size))];
+    });
   };
 
   const openTask = async (taskId: number) => {
@@ -62,15 +80,30 @@ export default function SupervisorTasks() {
   const save = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
-    const payload = {
-      ...form,
-      subtasks: form.subtasks.split('\n').filter((s: string) => s.trim()),
-    };
     try {
-      await api.post('/tasks', payload);
-      toast('Task created and assigned.', 'success');
+      const body = new FormData();
+      body.append('title', form.title);
+      body.append('description', form.description || '');
+      body.append('priority', form.priority);
+      if (form.start_date) body.append('start_date', form.start_date);
+      body.append('deadline', form.deadline);
+      body.append('member_ids', JSON.stringify(form.member_ids));
+      body.append(
+        'subtasks',
+        JSON.stringify(String(form.subtasks || '').split('\n').map((s: string) => s.trim()).filter(Boolean))
+      );
+      attachFiles.forEach((f) => body.append('files', f));
+
+      await api.post('/tasks', body, { headers: { 'Content-Type': 'multipart/form-data' } });
+      toast(
+        attachFiles.length
+          ? `Task created with ${attachFiles.length} file${attachFiles.length === 1 ? '' : 's'} attached.`
+          : 'Task created and assigned.',
+        'success'
+      );
       setCreateOpen(false);
       setForm({ ...emptyForm });
+      setAttachFiles([]);
       load();
     } catch (err) {
       toast(errMsg(err), 'error');
@@ -86,6 +119,14 @@ export default function SupervisorTasks() {
     toast('Task deleted.', 'success');
     if (detail?.task?.id === id) closeDetail();
     load();
+  };
+
+  const downloadTaskFile = async (taskId: number, f: any) => {
+    try {
+      await downloadFile(`/tasks/${taskId}/files/${f.id}`, f.original_name);
+    } catch (err) {
+      toast(errMsg(err), 'error');
+    }
   };
 
   const detailOpen = detailLoading || detail !== null;
@@ -186,6 +227,47 @@ export default function SupervisorTasks() {
                 {members.length === 0 && <p className="tiny">No members in your team yet.</p>}
               </div>
             </div>
+
+            <div className="field">
+              <label className="label">Attach documents for members</label>
+              <p className="tiny" style={{ marginBottom: 8 }}>
+                Optional briefing files (PDF or DOCX). Assigned members can download these from the task.
+              </p>
+              {attachFiles.length > 0 && (
+                <div style={{ display: 'grid', gap: 6, marginBottom: 10 }}>
+                  {attachFiles.map((f, i) => (
+                    <div key={`${f.name}-${f.size}`} className="row between" style={{ gap: 8 }}>
+                      <span className="row" style={{ gap: 8, minWidth: 0 }}>
+                        <IcoFile size={15} />
+                        <span style={{ fontSize: 13, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {f.name}
+                        </span>
+                        <span className="tiny">{fmtSize(f.size)}</span>
+                      </span>
+                      <button
+                        type="button"
+                        className="icon-btn"
+                        onClick={() => setAttachFiles((prev) => prev.filter((_, idx) => idx !== i))}
+                        title="Remove"
+                      >
+                        <IcoTrash size={14} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <label className="btn btn-ghost btn-sm" style={{ cursor: 'pointer', width: 'fit-content' }}>
+                <IcoUpload size={15} /> {attachFiles.length ? 'Add more files' : 'Attach files'}
+                <input
+                  type="file"
+                  accept=".pdf,.doc,.docx,application/pdf,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  multiple
+                  hidden
+                  onChange={(e) => { addFiles(e.target.files); e.target.value = ''; }}
+                />
+              </label>
+            </div>
+
             <div className="field">
               <label className="label">Subtasks (one per line)</label>
               <textarea
@@ -235,6 +317,29 @@ export default function SupervisorTasks() {
                   <div className="label">Created by</div>
                   <div style={{ fontWeight: 600 }}>{detail.task.created_by_name}</div>
                 </div>
+              </div>
+
+              <div>
+                <div className="label" style={{ marginBottom: 10 }}>
+                  Attached documents ({(detail.files || []).length})
+                </div>
+                {(detail.files || []).length === 0 ? (
+                  <p className="tiny muted">No documents attached to this task.</p>
+                ) : (
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    {(detail.files || []).map((f: any) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        className="btn btn-ghost btn-sm"
+                        style={{ justifyContent: 'flex-start', width: 'fit-content' }}
+                        onClick={() => downloadTaskFile(detail.task.id, f)}
+                      >
+                        <IcoFile size={15} /> {f.original_name} ({fmtSize(Number(f.size_bytes) || 0)})
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
 
               <div>

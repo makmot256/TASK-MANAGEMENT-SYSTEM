@@ -1,31 +1,60 @@
 import { Router } from 'express';
+import path from 'path';
 import { pool, withTransaction } from '../config/db.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { asyncHandler, HttpError } from '../middleware/error.js';
 import { notify, logActivity } from '../utils/notify.js';
 import { memberIdsForSupervisor } from '../utils/scope.js';
+import { upload, uploadRoot } from '../middleware/upload.js';
 
 const router = Router();
 router.use(authenticate);
 
 const STATUSES = ['To-Do', 'In Progress', 'Under Review', 'Completed'];
 
-// POST /api/tasks  (supervisor creates + assigns a task)  -- SRS UC1
+function parseJsonArray(value, fieldName) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === '') return [];
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      // Allow newline-separated fallback for subtasks text fields.
+      if (fieldName === 'subtasks') {
+        return value.split('\n').map((s) => s.trim()).filter(Boolean);
+      }
+    }
+  }
+  throw new HttpError(400, `Invalid ${fieldName} payload.`);
+}
+
+// POST /api/tasks  (supervisor creates + assigns a task, optional briefing files)
 router.post(
   '/',
   requireRole('supervisor', 'admin'),
+  upload.array('files', 10),
   asyncHandler(async (req, res) => {
-    const { title, description, priority, start_date, deadline, team_id, member_ids, subtasks } = req.body;
-    if (!title || !deadline) throw new HttpError(400, 'Title and deadline are mandatory.'); // SRS business rule
-    if (!Array.isArray(member_ids) || member_ids.length === 0)
-      throw new HttpError(400, 'Assign the task to at least one member.');
+    const title = String(req.body.title || '').trim();
+    const description = req.body.description || null;
+    const priority = req.body.priority || 'Medium';
+    const start_date = req.body.start_date || null;
+    const deadline = req.body.deadline;
+    const team_id = req.body.team_id || null;
+    const member_ids = parseJsonArray(req.body.member_ids, 'member_ids').map(Number).filter(Boolean);
+    const subtasks = parseJsonArray(req.body.subtasks, 'subtasks');
+
+    if (!title || !deadline) throw new HttpError(400, 'Title and deadline are mandatory.');
+    if (!member_ids.length) throw new HttpError(400, 'Assign the task to at least one member.');
+
+    const files = req.files || [];
 
     const taskId = await withTransaction(async (conn) => {
       const [result] = await conn.execute(
         `INSERT INTO tasks (title, description, priority, start_date, deadline, team_id, created_by)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [title, description || null, priority || 'Medium', start_date || null, deadline, team_id || null, req.user.id]
+        [title, description, priority, start_date, deadline, team_id, req.user.id]
       );
       const id = result.insertId;
 
@@ -40,28 +69,36 @@ router.post(
         );
       }
 
-      if (Array.isArray(subtasks)) {
-        let pos = 0;
-        for (const st of subtasks) {
-          if (st && st.trim()) {
-            await conn.execute(`INSERT INTO subtasks (task_id, title, position) VALUES (?, ?, ?)`, [id, st.trim(), pos++]);
-          }
+      let pos = 0;
+      for (const st of subtasks) {
+        const text = typeof st === 'string' ? st.trim() : String(st?.title || '').trim();
+        if (text) {
+          await conn.execute(`INSERT INTO subtasks (task_id, title, position) VALUES (?, ?, ?)`, [id, text, pos++]);
         }
+      }
+
+      for (const f of files) {
+        await conn.execute(
+          `INSERT INTO task_files (task_id, original_name, stored_name, mime_type, size_bytes)
+           VALUES (?, ?, ?, ?, ?)`,
+          [id, f.originalname, f.filename, f.mimetype, f.size]
+        );
       }
       return id;
     });
 
+    const fileNote = files.length ? ` (${files.length} file${files.length === 1 ? '' : 's'} attached)` : '';
     for (const memberId of member_ids) {
       await notify(memberId, {
         type: 'task_assigned',
         title: 'New task assigned',
-        body: `"${title}" is due ${new Date(deadline).toLocaleString()}`,
+        body: `"${title}" is due ${new Date(deadline).toLocaleString()}${fileNote}`,
         link: `/tasks/${taskId}`,
       });
     }
-    await logActivity(req.user.id, 'task_update', { action: 'create', taskId }, null);
+    await logActivity(req.user.id, 'task_update', { action: 'create', taskId, files: files.length }, null);
 
-    res.status(201).json({ id: taskId, message: 'Task created and assigned.' });
+    res.status(201).json({ id: taskId, message: 'Task created and assigned.', files: files.length });
   })
 );
 
@@ -141,7 +178,45 @@ router.get(
         WHERE st.task_id = ? ORDER BY st.position`,
       [req.params.id]
     );
-    res.json({ task, assignments, subtasks });
+    const [files] = await pool.execute(
+      `SELECT id, original_name, mime_type, size_bytes, uploaded_at
+         FROM task_files WHERE task_id = ? ORDER BY uploaded_at`,
+      [req.params.id]
+    );
+    res.json({ task, assignments, subtasks, files });
+  })
+);
+
+// GET /api/tasks/:taskId/files/:fileId  (download briefing attachment)
+router.get(
+  '/:taskId/files/:fileId',
+  asyncHandler(async (req, res) => {
+    const [files] = await pool.execute(
+      `SELECT f.*, t.created_by
+         FROM task_files f
+         JOIN tasks t ON t.id = f.task_id
+        WHERE f.id = ? AND f.task_id = ?`,
+      [req.params.fileId, req.params.taskId]
+    );
+    if (!files.length) throw new HttpError(404, 'File not found.');
+    const file = files[0];
+
+    if (req.user.role === 'member') {
+      const [asg] = await pool.execute(
+        `SELECT id FROM task_assignments WHERE task_id = ? AND member_id = ? LIMIT 1`,
+        [req.params.taskId, req.user.id]
+      );
+      if (!asg.length) throw new HttpError(403, 'You are not assigned to this task.');
+    } else if (req.user.role === 'supervisor' && file.created_by !== req.user.id) {
+      const ids = await memberIdsForSupervisor(req.user.id);
+      const [asg] = await pool.execute(
+        `SELECT member_id FROM task_assignments WHERE task_id = ?`,
+        [req.params.taskId]
+      );
+      if (!asg.some((a) => ids.includes(a.member_id))) throw new HttpError(403, 'Not in your scope.');
+    }
+
+    res.download(path.join(uploadRoot, file.stored_name), file.original_name);
   })
 );
 
