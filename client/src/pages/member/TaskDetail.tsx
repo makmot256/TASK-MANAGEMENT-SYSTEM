@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, errMsg } from '../../api/client';
+import { api, errMsg, downloadFile } from '../../api/client';
 import { useToast } from '../../context/ToastContext';
 import { StatusBadge, PriorityBadge, Avatar, fmtDateTime, Loader, Spinner } from '../../components/ui';
 import { IcoUpload, IcoCheck, IcoFile, IcoPlus, IcoTrash } from '../../lib/icons';
@@ -115,6 +115,34 @@ export default function TaskDetail() {
             <div className="divider" />
             <div className="row" style={{ gap: 8 }}><span className="muted" style={{ fontSize: 14 }}>Assigned by</span><strong style={{ fontSize: 14 }}>{t.created_by_name}</strong>{t.team_name && <span className="badge badge-brand">{t.team_name}</span>}</div>
           </div>
+
+          {(data.files || []).length > 0 && (
+            <div className="card card-pad">
+              <h3 className="card-title" style={{ marginBottom: 12 }}>
+                Documents from supervisor ({data.files.length})
+              </h3>
+              <p className="tiny" style={{ marginBottom: 10 }}>Download briefing files attached to this assignment.</p>
+              <div style={{ display: 'grid', gap: 8 }}>
+                {data.files.map((f: any) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className="btn btn-ghost btn-sm"
+                    style={{ justifyContent: 'flex-start', width: 'fit-content' }}
+                    onClick={async () => {
+                      try {
+                        await downloadFile(`/tasks/${id}/files/${f.id}`, f.original_name);
+                      } catch (err) {
+                        toast(errMsg(err), 'error');
+                      }
+                    }}
+                  >
+                    <IcoFile size={15} /> {f.original_name} ({fmtSize(Number(f.size_bytes) || 0)})
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="card card-pad">
             <div className="row between" style={{ marginBottom: 4 }}>
