@@ -28,6 +28,12 @@ export const env = {
   scoringCron: process.env.SCORING_CRON || '0 2 * * *',
   peerReviewersPerSubmission: num(process.env.PEER_REVIEWERS_PER_SUBMISSION, 3),
 
+  // Semantic similarity (sentence embeddings)
+  embeddingModel: process.env.EMBEDDING_MODEL || 'Xenova/all-MiniLM-L6-v2',
+  similarityThreshold: num(process.env.SIMILARITY_THRESHOLD, 0.7),
+  similarityMinWords: num(process.env.SIMILARITY_MIN_WORDS, 20),
+  similarityTopK: num(process.env.SIMILARITY_TOP_K, 5),
+
   smtp: {
     host: process.env.SMTP_HOST || '',
     port: num(process.env.SMTP_PORT, 587),

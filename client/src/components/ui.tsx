@@ -79,7 +79,7 @@ export const timeAgo = (d: string) => {
 export function Modal({ title, onClose, children, footer, wide }: { title: string; onClose: () => void; children: React.ReactNode; footer?: React.ReactNode; wide?: boolean }) {
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className="modal" style={wide ? { maxWidth: 760 } : undefined} onClick={(e) => e.stopPropagation()}>
+      <div className="modal" style={wide ? { maxWidth: 980 } : undefined} onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
           <h3 style={{ fontSize: 17 }}>{title}</h3>
           <button className="icon-btn" onClick={onClose}><IcoX size={18} /></button>

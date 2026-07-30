@@ -12,6 +12,11 @@ import {
   canViewSubmissionForPeerReview,
   getPeerReviewersForSubmission,
 } from '../services/peer-assignment.service.js';
+import {
+  findSimilarSubmissions,
+  scheduleSubmissionEmbedding,
+  similarityBadgesForIds,
+} from '../services/similarity.service.js';
 
 const router = Router();
 router.use(authenticate);
@@ -77,6 +82,11 @@ router.post(
       body: `${req.user.full_name} submitted a report for "${a.title}".${peerLine}`,
       link: `/review/${submissionId}`,
     });
+
+    // Semantic embedding for supervisor similarity hints (async; does not block submit).
+    if (content && String(content).trim()) {
+      scheduleSubmissionEmbedding(submissionId);
+    }
 
     res.status(201).json({
       id: submissionId,
@@ -160,6 +170,11 @@ router.get(
       row.peer_reviewers = await getPeerReviewersForSubmission(row.id);
     }
 
+    const badges = await similarityBadgesForIds(rows.map((r) => r.id));
+    for (const row of rows) {
+      row.similarity = badges[row.id] || null;
+    }
+
     const counts = {
       all: rows.length,
       new: rows.filter((r) => r.queue_status === 'new').length,
@@ -205,6 +220,29 @@ router.get(
       awaiting: pendingCount,
       pending: newCount + pendingCount,
     });
+  })
+);
+
+// GET /api/submissions/:id/similarity  (supervisor semantic similarity hints)
+router.get(
+  '/:id/similarity',
+  requireRole('supervisor', 'admin'),
+  asyncHandler(async (req, res) => {
+    const [rows] = await pool.execute(
+      `SELECT id, member_id FROM submissions WHERE id = ? LIMIT 1`,
+      [req.params.id]
+    );
+    if (!rows.length) throw new HttpError(404, 'Submission not found.');
+    const sub = rows[0];
+
+    let memberScopeIds = null;
+    if (req.user.role === 'supervisor') {
+      memberScopeIds = await memberIdsForSupervisor(req.user.id);
+      if (!memberScopeIds.includes(sub.member_id)) throw new HttpError(403, 'Not in your scope.');
+    }
+
+    const result = await findSimilarSubmissions(sub.id, { memberScopeIds });
+    res.json(result);
   })
 );
 

@@ -8,6 +8,7 @@
     "db-setup": "npm --prefix server run db:setup",
     "db-migrate": "npm --prefix server run db:migrate",
     "db-seed": "npm --prefix server run db:seed",
+    "embeddings-backfill": "npm --prefix server run jobs:embeddings",
     "predev": "npx --yes kill-port 4000 5173 5174",
     "dev": "concurrently -n SERVER,CLIENT -c blue,magenta \"npm --prefix server run dev\" \"npx --yes wait-on -t 60000 http://localhost:4000/api/health && npm --prefix client run dev\"",
     "server": "npm --prefix server run dev",

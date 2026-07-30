@@ -15,7 +15,7 @@ async function reset() {
   const tables = [
     'notifications', 'activity_logs', 'engagement_scores', 'performance_scores',
     'supervisor_assessments', 'peer_assessments', 'evaluation_cycles',
-    'report_comments', 'submission_files', 'submissions',
+    'report_comments', 'submission_files', 'submission_embeddings', 'submissions',
     'task_status_history', 'task_assignments', 'subtasks', 'tasks',
     'team_members', 'team_supervisors', 'teams', 'login_audit', 'password_resets',
   ];
@@ -129,10 +129,25 @@ async function main() {
       // submissions for completed / under review
       if (status === 'Completed' || status === 'Under Review') {
         const isLate = onTime === 0 ? 1 : 0;
+        // Shared "boilerplate" used by some teammates so semantic similarity can demo matches.
+        const sharedBoilerplate =
+          'This week I focused on completing the assigned deliverables for the internship task. ' +
+          'I reviewed the requirements, implemented the core changes, and verified the happy path with basic testing. ' +
+          'I also updated documentation and noted remaining edge cases for the next iteration. ' +
+          'No major blockers remain, and I am ready for supervisor review.';
+        const uniqueReport =
+          `Progress update for "${taskTitles[i]}" by ${m.name}. ` +
+          `I completed planning, implemented the main flow, and ran smoke tests on the critical path. ` +
+          `Challenges included clarifying acceptance criteria and coordinating with teammates on shared modules. ` +
+          `Next steps: polish error handling, add missing unit tests, and prepare the final walkthrough.`;
+        // ~30% of reports reuse near-identical wording (paraphrase/copy demo for ML similarity).
+        const content = Math.random() < 0.3
+          ? `${sharedBoilerplate} Task reference: ${taskTitles[i]}.`
+          : uniqueReport;
         const [sr] = await pool.execute(
           `INSERT INTO submissions (task_id, assignment_id, member_id, content, kind, is_late, submitted_at)
            VALUES (?, ?, ?, ?, 'weekly_report', ?, ?)`,
-          [taskId, ar.insertId, m.id, `Weekly progress report for ${taskTitles[i]}. Completed the core implementation and ran initial tests.`, isLate, daysAgo(rand(1, 9))]
+          [taskId, ar.insertId, m.id, content, isLate, daysAgo(rand(1, 9))]
         );
         const subId = sr.insertId;
         // supervisor feedback + assessment

@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, errMsg, downloadFile } from '../../api/client';
 import { useToast } from '../../context/ToastContext';
-import { Avatar, fmtDateTime, Loader, Spinner } from '../../components/ui';
+import { Avatar, fmtDateTime, Loader, Spinner, Modal } from '../../components/ui';
 import { IcoFile, IcoStar, IcoTrash, IcoEdit } from '../../lib/icons';
 
 const Stars = ({ value, onPick }: { value: number; onPick: (n: number) => void }) => (
@@ -12,6 +12,12 @@ const Stars = ({ value, onPick }: { value: number; onPick: (n: number) => void }
     ))}
   </div>
 );
+
+const kindLabel: Record<string, string> = {
+  own_past: 'Own past report',
+  teammate: 'Teammate report',
+  task_brief: 'Task brief',
+};
 
 export default function ReviewDetail() {
   const { id } = useParams();
@@ -23,16 +29,65 @@ export default function ReviewDetail() {
   const [editing, setEditing] = useState<number | null>(null);
   const [editBody, setEditBody] = useState('');
   const [busy, setBusy] = useState(false);
+  const [similarity, setSimilarity] = useState<any>(null);
+  const [simLoading, setSimLoading] = useState(true);
+  const [compareMatch, setCompareMatch] = useState<any>(null);
+  const [compareData, setCompareData] = useState<any>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
 
   const load = async () => {
-    const { data } = await api.get(`/submissions/${id}`);
-    setData(data);
-    if (data.assessment) setQuality(data.assessment.quality_score);
+    try {
+      const { data: next } = await api.get(`/submissions/${id}`);
+      setData(next);
+      setQuality(next.assessment?.quality_score || 0);
+      setComment('');
+      setEditing(null);
+    } catch (err) {
+      toast(errMsg(err), 'error');
+      setData(null);
+    }
   };
-  useEffect(() => { load(); }, [id]);
 
-  if (!data) return <div className="page"><Loader /></div>;
-  const s = data.submission;
+  useEffect(() => {
+    setData(null);
+    setSimilarity(null);
+    setCompareMatch(null);
+    setCompareData(null);
+    load();
+  }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
+    let cancelled = false;
+    (async () => {
+      setSimLoading(true);
+      try {
+        const { data: sim } = await api.get(`/submissions/${id}/similarity`);
+        if (!cancelled) setSimilarity(sim);
+      } catch {
+        if (!cancelled) setSimilarity({ ok: false, reason: 'unavailable', matches: [] });
+      } finally {
+        if (!cancelled) setSimLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [id]);
+
+  const openCompare = async (match: any) => {
+    if (!match?.submission_id) return;
+    setCompareMatch(match);
+    setCompareData(null);
+    setCompareLoading(true);
+    try {
+      const { data: other } = await api.get(`/submissions/${match.submission_id}`);
+      setCompareData(other);
+    } catch (err) {
+      toast(errMsg(err), 'error');
+      setCompareMatch(null);
+    } finally {
+      setCompareLoading(false);
+    }
+  };
 
   const postComment = async () => {
     if (!comment.trim()) { toast('Comment cannot be empty.', 'error'); return; }
@@ -65,6 +120,8 @@ export default function ReviewDetail() {
     } catch (err) { toast(errMsg(err), 'error'); } finally { setBusy(false); }
   };
 
+  if (!data) return <div className="page"><Loader /></div>;
+  const s = data.submission;
   const peerReviewers = data.peer_reviewers || [];
 
   return (
@@ -148,6 +205,77 @@ export default function ReviewDetail() {
           </div>
 
           <div className="card card-pad">
+            <div className="row between wrap" style={{ gap: 10, marginBottom: 10 }}>
+              <div>
+                <h3 className="card-title" style={{ margin: 0 }}>Similarity analysis</h3>
+                <p className="tiny" style={{ marginTop: 4, marginBottom: 0 }}>
+                  Semantic meaning match using sentence embeddings. Review hint only — not a plagiarism verdict.
+                </p>
+              </div>
+              {similarity?.matches?.length > 0 && (
+                <span className="badge badge-amber">{similarity.matches.length} match(es)</span>
+              )}
+            </div>
+
+            {simLoading ? (
+              <div className="row" style={{ gap: 8 }}><Spinner /> <span className="muted" style={{ fontSize: 13 }}>Running embedding model… (first run may take a minute)</span></div>
+            ) : !similarity?.ok && similarity?.reason === 'model_unavailable' ? (
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>Similarity unavailable right now. Try again shortly.</p>
+            ) : similarity?.reason === 'no_typed_content' ? (
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>No typed report text to analyze (file-only uploads are skipped in v1).</p>
+            ) : similarity?.reason === 'too_short' ? (
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>
+                Report is too short for a reliable comparison
+                {similarity?.meta?.min_words ? ` (needs about ${similarity.meta.min_words}+ words)` : ''}.
+              </p>
+            ) : !similarity?.matches?.length ? (
+              <p className="muted" style={{ fontSize: 13, margin: 0 }}>No strong similarities found among this member’s past reports or teammates.</p>
+            ) : (
+              <div style={{ display: 'grid', gap: 10 }}>
+                {similarity.matches.map((m: any, i: number) => (
+                  <div
+                    key={`${m.kind}-${m.submission_id ?? 'brief'}-${i}`}
+                    className="row between wrap"
+                    style={{
+                      gap: 12,
+                      padding: '12px 14px',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-sm)',
+                      background: 'var(--surface-2)',
+                    }}
+                  >
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <div className="row wrap" style={{ gap: 8, marginBottom: 4 }}>
+                        <strong style={{ fontSize: 18 }}>~{m.percent}%</strong>
+                        <span className="badge badge-brand">{kindLabel[m.kind] || m.kind}</span>
+                      </div>
+                      {m.kind === 'task_brief' ? (
+                        <p style={{ margin: 0, fontSize: 14 }}>
+                          Close in meaning to the assigned task brief
+                          {m.task_title ? ` (“${m.task_title}”)` : ''}.
+                        </p>
+                      ) : (
+                        <p style={{ margin: 0, fontSize: 14 }}>
+                          Similar to {m.member_name}’s report on “{m.task_title}”
+                          {m.submitted_at ? ` · ${fmtDateTime(m.submitted_at)}` : ''}
+                        </p>
+                      )}
+                    </div>
+                    {m.submission_id && (
+                      <button type="button" className="btn btn-ghost btn-sm" onClick={() => openCompare(m)}>
+                        View report
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {similarity?.meta?.disclaimer && (
+              <p className="tiny" style={{ marginTop: 12, marginBottom: 0 }}>{similarity.meta.disclaimer}</p>
+            )}
+          </div>
+
+          <div className="card card-pad">
             <h3 className="card-title" style={{ marginBottom: 14 }}>Feedback thread</h3>
             {data.comments.length === 0 && <p className="muted" style={{ marginBottom: 14 }}>No feedback yet. Be the first to comment.</p>}
             {data.comments.map((c: any) => (
@@ -191,6 +319,64 @@ export default function ReviewDetail() {
           <p className="tiny" style={{ marginTop: 12 }}>Quality &amp; responsiveness feed the member's Supervisor Assessment (SA) in the Performance Index.</p>
         </div>
       </div>
+
+      {compareMatch && (
+        <Modal
+          title={`Compare reports (~${compareMatch.percent}% similar)`}
+          onClose={() => { setCompareMatch(null); setCompareData(null); }}
+          wide
+          footer={
+            <div className="row" style={{ gap: 8, justifyContent: 'flex-end' }}>
+              <button type="button" className="btn btn-ghost" onClick={() => { setCompareMatch(null); setCompareData(null); }}>
+                Close
+              </button>
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  const otherId = compareMatch.submission_id;
+                  setCompareMatch(null);
+                  setCompareData(null);
+                  nav(`/review/${otherId}`);
+                }}
+              >
+                Open full review
+              </button>
+            </div>
+          }
+        >
+          {compareLoading || !compareData ? (
+            <div className="row" style={{ gap: 8 }}><Spinner /> <span className="muted">Loading matched report…</span></div>
+          ) : (
+            <div className="grid responsive-split" style={{ gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+              <div className="card card-pad" style={{ margin: 0 }}>
+                <div className="row between wrap" style={{ gap: 8, marginBottom: 10 }}>
+                  <h4 className="card-title" style={{ margin: 0 }}>Current report</h4>
+                  <span className="badge badge-brand">This submission</span>
+                </div>
+                <p className="tiny" style={{ marginTop: 0 }}>
+                  {s.member_name} · {s.task_title} · {fmtDateTime(s.submitted_at)}
+                </p>
+                {s.content
+                  ? <p style={{ lineHeight: 1.65, whiteSpace: 'pre-wrap', fontSize: 14 }}>{s.content}</p>
+                  : <p className="muted">No typed content.</p>}
+              </div>
+              <div className="card card-pad" style={{ margin: 0 }}>
+                <div className="row between wrap" style={{ gap: 8, marginBottom: 10 }}>
+                  <h4 className="card-title" style={{ margin: 0 }}>Matched report</h4>
+                  <span className="badge badge-amber">{kindLabel[compareMatch.kind] || compareMatch.kind}</span>
+                </div>
+                <p className="tiny" style={{ marginTop: 0 }}>
+                  {compareData.submission.member_name} · {compareData.submission.task_title} · {fmtDateTime(compareData.submission.submitted_at)}
+                </p>
+                {compareData.submission.content
+                  ? <p style={{ lineHeight: 1.65, whiteSpace: 'pre-wrap', fontSize: 14 }}>{compareData.submission.content}</p>
+                  : <p className="muted">No typed content.</p>}
+              </div>
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }
