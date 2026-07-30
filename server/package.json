@@ -11,9 +11,11 @@
     "db:setup": "node src/db/setup.js",
     "db:migrate": "node src/db/migrate.js",
     "db:seed": "node src/db/seed.js",
-    "jobs:run": "node src/jobs/runNow.js"
+    "jobs:run": "node src/jobs/runNow.js",
+    "jobs:embeddings": "node src/jobs/backfillEmbeddings.js"
   },
   "dependencies": {
+    "@xenova/transformers": "^2.17.2",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",

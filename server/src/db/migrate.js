@@ -186,6 +186,26 @@ async function run() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
+  console.log('  - Ensuring submission_embeddings table (semantic similarity)');
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS submission_embeddings (
+      submission_id    BIGINT UNSIGNED NOT NULL,
+      model_name       VARCHAR(120)    NOT NULL,
+      content_hash     CHAR(64)        NOT NULL,
+      embedding_json   LONGTEXT        NOT NULL,
+      dims             INT UNSIGNED    NOT NULL,
+      top_match_score  DECIMAL(6,4)    NULL,
+      top_match_id     BIGINT UNSIGNED NULL,
+      top_match_kind   VARCHAR(32)     NULL,
+      created_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at       DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (submission_id),
+      KEY idx_emb_top (top_match_score),
+      CONSTRAINT fk_emb_submission FOREIGN KEY (submission_id) REFERENCES submissions (id) ON DELETE CASCADE,
+      CONSTRAINT fk_emb_top_match  FOREIGN KEY (top_match_id)  REFERENCES submissions (id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
   console.log('> Migrations complete.');
   await pool.end();
 }

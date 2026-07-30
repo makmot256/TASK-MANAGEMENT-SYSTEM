@@ -172,7 +172,19 @@ export default function ReviewQueue() {
                       )}
                     </td>
                     <td className="muted">{fmtDateTime(s.submitted_at)}</td>
-                    <td>{statusBadge(s)}</td>
+                    <td>
+                      <div className="row wrap" style={{ gap: 6 }}>
+                        {statusBadge(s)}
+                        {s.similarity && (
+                          <span
+                            className="badge badge-amber"
+                            title={`Semantic similarity ~${s.similarity.percent}% (${s.similarity.kind || 'match'})`}
+                          >
+                            Similar ~{s.similarity.percent}%
+                          </span>
+                        )}
+                      </div>
+                    </td>
                     <td>
                       <button className="btn btn-primary btn-sm" onClick={() => nav(`/review/${s.id}`)}>
                         Open
