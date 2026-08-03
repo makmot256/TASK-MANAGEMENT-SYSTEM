@@ -7,6 +7,7 @@ import { asyncHandler, HttpError } from '../middleware/error.js';
 import { upload, uploadRoot } from '../middleware/upload.js';
 import { notify, logActivity } from '../utils/notify.js';
 import { memberIdsForSupervisor } from '../utils/scope.js';
+import { runRuleBasedComplianceCheck } from '../services/compliance.service.js';
 import {
   assignPeerReviewersForSubmission,
   canViewSubmissionForPeerReview,
@@ -257,6 +258,34 @@ router.get(
       assessment: assessment[0] || null,
       peer_reviewers,
     });
+  })
+);
+
+// GET /api/submissions/:id/compliance  (live rule-based compliance check)
+router.get(
+  '/:id/compliance',
+  requireRole('supervisor', 'admin'),
+  asyncHandler(async (req, res) => {
+    const [rows] = await pool.execute(
+      `SELECT s.id, s.member_id, s.content, s.is_late,
+              (SELECT COUNT(*) FROM submission_files f WHERE f.submission_id = s.id) AS file_count
+       FROM submissions s WHERE s.id = ?`,
+      [req.params.id]
+    );
+    if (!rows.length) throw new HttpError(404, 'Submission not found.');
+    const sub = rows[0];
+
+    if (req.user.role === 'supervisor') {
+      const ids = await memberIdsForSupervisor(req.user.id);
+      if (!ids.includes(sub.member_id)) throw new HttpError(403, 'Not in your scope.');
+    }
+
+    const result = runRuleBasedComplianceCheck({
+      is_late: sub.is_late,
+      content: sub.content || '',
+      file_count: sub.file_count,
+    });
+    res.json({ submission_id: sub.id, ...result });
   })
 );
 

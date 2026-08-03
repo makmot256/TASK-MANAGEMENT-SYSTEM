@@ -3,7 +3,11 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { api, errMsg, downloadFile } from '../../api/client';
 import { useToast } from '../../context/ToastContext';
 import { Avatar, fmtDateTime, Loader, Spinner } from '../../components/ui';
-import { IcoFile, IcoStar, IcoTrash, IcoEdit } from '../../lib/icons';
+import { IcoFile, IcoStar, IcoTrash, IcoEdit, IcoShield, IcoCheck, IcoX } from '../../lib/icons';
+
+// Compliance score thresholds: >=80 green, >=50 amber, <50 red.
+const scoreColor = (score: number) =>
+  score >= 80 ? 'var(--green)' : score >= 50 ? 'var(--amber)' : 'var(--red)';
 
 const Stars = ({ value, onPick }: { value: number; onPick: (n: number) => void }) => (
   <div className="row" style={{ gap: 4 }}>
@@ -23,6 +27,9 @@ export default function ReviewDetail() {
   const [editing, setEditing] = useState<number | null>(null);
   const [editBody, setEditBody] = useState('');
   const [busy, setBusy] = useState(false);
+  const [compliance, setCompliance] = useState<any>(null);
+  const [complianceBusy, setComplianceBusy] = useState(false);
+  const [complianceError, setComplianceError] = useState<string | null>(null);
 
   const load = async () => {
     const { data } = await api.get(`/submissions/${id}`);
@@ -30,6 +37,20 @@ export default function ReviewDetail() {
     if (data.assessment) setQuality(data.assessment.quality_score);
   };
   useEffect(() => { load(); }, [id]);
+
+  const runCompliance = async () => {
+    setComplianceBusy(true);
+    setComplianceError(null);
+    try {
+      const { data } = await api.get(`/submissions/${id}/compliance`);
+      setCompliance(data);
+    } catch (err) {
+      setComplianceError(errMsg(err));
+    } finally {
+      setComplianceBusy(false);
+    }
+  };
+  useEffect(() => { runCompliance(); }, [id]);
 
   if (!data) return <div className="page"><Loader /></div>;
   const s = data.submission;
@@ -66,6 +87,7 @@ export default function ReviewDetail() {
   };
 
   const peerReviewers = data.peer_reviewers || [];
+  const memberFirstName = s.member_name?.split(' ')[0] || 'Member';
 
   return (
     <div className="page">
@@ -178,17 +200,87 @@ export default function ReviewDetail() {
           </div>
         </div>
 
-        <div className="card card-pad" style={{ alignSelf: 'start' }}>
-          <h3 className="card-title" style={{ marginBottom: 14 }}>Assess submission</h3>
-          <div className="field"><label className="label">Quality score (0-5)</label><Stars value={quality} onPick={setQuality} /></div>
-          {data.assessment?.responsiveness_score != null && (
-            <div className="field"><label className="label">Responsiveness</label><span className="badge badge-brand">{data.assessment.responsiveness_score}/5</span></div>
-          )}
-          <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
-            <button className="btn btn-primary btn-block" disabled={busy} onClick={() => assess({ mark_completed: true })}>{busy ? <Spinner /> : 'Approve & mark complete'}</button>
-            <button className="btn btn-accent btn-block" disabled={busy} onClick={() => assess({ request_revision: true })}>Request revision</button>
+        <div style={{ display: 'grid', gap: 18, alignSelf: 'start' }}>
+          <div className="card card-pad">
+            <div className="row between" style={{ marginBottom: 12 }}>
+              <h3 className="card-title" style={{ margin: 0 }}>Compliance check</h3>
+              <button className="btn btn-ghost btn-sm" onClick={runCompliance} disabled={complianceBusy}>
+                {complianceBusy ? 'Checking…' : 'Refresh'}
+              </button>
+            </div>
+            {complianceError ? (
+              <div className="row between" style={{ gap: 10 }}>
+                <p className="muted" style={{ margin: 0, fontSize: 13, flex: 1 }}>
+                  Compliance check unavailable. {complianceError}
+                </p>
+                <button className="btn btn-ghost btn-sm" onClick={runCompliance} disabled={complianceBusy}>
+                  <IcoShield size={13} /> Retry
+                </button>
+              </div>
+            ) : !compliance ? (
+              <Loader />
+            ) : (
+              <>
+                <div className="row" style={{ gap: 14, alignItems: 'center' }}>
+                  <div
+                    style={{ fontSize: 36, fontWeight: 800, lineHeight: 1, color: scoreColor(compliance.score) }}
+                  >
+                    {compliance.score}%
+                  </div>
+                  <div>
+                    <span className={`badge ${compliance.pass ? 'badge-green' : 'badge-red'}`}>
+                      {compliance.pass ? `${memberFirstName} is compliant` : `${memberFirstName} is not compliant`}
+                    </span>
+                  </div>
+                </div>
+
+                <div className="progress" style={{ marginTop: 12 }}>
+                  <span style={{ width: `${compliance.score}%`, background: scoreColor(compliance.score) }} />
+                </div>
+
+                <div style={{ fontSize: 16, fontWeight: 700, marginTop: 12, marginBottom: 6 }}>Criteria</div>
+                {(compliance.criteria || []).length > 0 && (
+                  <div style={{ display: 'grid', gap: 8 }}>
+                    {(compliance.criteria as any[]).map((c: any) => (
+                      <div key={c.key} className="row" style={{ gap: 8, alignItems: 'flex-start' }}>
+                        <span
+                          style={{
+                            color: c.pass ? 'var(--green)' : 'var(--red)',
+                            display: 'inline-flex',
+                            flexShrink: 0,
+                            marginTop: 1,
+                          }}
+                        >
+                          {c.pass ? <IcoCheck size={15} /> : <IcoX size={15} />}
+                        </span>
+                        <div>
+                          <span style={{ fontSize: 13, fontWeight: 600 }}>{c.label}</span>
+                          <span className="tiny" style={{ display: 'block', marginTop: 1 }}>{c.detail}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="divider" style={{ margin: '14px 0' }} />
+                <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Suggested action</div>
+                <p className="tiny" style={{ margin: 0, lineHeight: 1.6 }}>{compliance.suggested_action}</p>
+              </>
+            )}
           </div>
-          <p className="tiny" style={{ marginTop: 12 }}>Quality &amp; responsiveness feed the member's Supervisor Assessment (SA) in the Performance Index.</p>
+
+          <div className="card card-pad">
+            <h3 className="card-title" style={{ marginBottom: 14 }}>Assess submission</h3>
+            <div className="field"><label className="label">Quality score (0-5)</label><Stars value={quality} onPick={setQuality} /></div>
+            {data.assessment?.responsiveness_score != null && (
+              <div className="field"><label className="label">Responsiveness</label><span className="badge badge-brand">{data.assessment.responsiveness_score}/5</span></div>
+            )}
+            <div style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+              <button className="btn btn-primary btn-block" disabled={busy} onClick={() => assess({ mark_completed: true })}>{busy ? <Spinner /> : 'Approve & mark complete'}</button>
+              <button className="btn btn-accent btn-block" disabled={busy} onClick={() => assess({ request_revision: true })}>Request revision</button>
+            </div>
+            <p className="tiny" style={{ marginTop: 12 }}>Quality &amp; responsiveness feed the member's Supervisor Assessment (SA) in the Performance Index.</p>
+          </div>
         </div>
       </div>
     </div>
