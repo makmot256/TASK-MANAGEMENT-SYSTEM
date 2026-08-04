@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../../api/client';
+import { api, errMsg } from '../../api/client';
 import { Avatar, fmtDateTime, Loader, EmptyState } from '../../components/ui';
 import { IcoReview } from '../../lib/icons';
 
@@ -20,10 +20,13 @@ export default function ReviewQueue() {
   const [counts, setCounts] = useState({ all: 0, new: 0, pending: 0, completed: 0 });
   const [attention, setAttention] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [filter, setFilter] = useState<Filter>('new');
 
-  useEffect(() => {
-    (async () => {
+  const load = async () => {
+    setLoading(true);
+    setLoadError(null);
+    try {
       const { data } = await api.get('/submissions/review');
       const list = data.submissions || [];
       setSubs(list);
@@ -40,9 +43,14 @@ export default function ReviewQueue() {
         completed: c.completed ?? c.reviewed ?? 0,
       });
       setAttention(Number(data.pending) || (c.new || 0) + (c.pending || 0));
+    } catch (err) {
+      setLoadError(errMsg(err));
+    } finally {
       setLoading(false);
-    })();
-  }, []);
+    }
+  };
+
+  useEffect(() => { load(); }, []);
 
   const shown = useMemo(() => {
     if (filter === 'all') return subs;
@@ -105,7 +113,14 @@ export default function ReviewQueue() {
       </div>
 
       <div className="card" style={{ marginTop: 22 }}>
-        {loading ? <div className="card-pad"><Loader /></div> : shown.length === 0 ? (
+        {loading ? <div className="card-pad"><Loader /></div> : loadError ? (
+          <div className="card-pad">
+            <p className="muted" style={{ margin: '0 0 12px' }}>
+              Couldn't load the review queue. {loadError}
+            </p>
+            <button className="btn btn-primary btn-sm" onClick={load}>Retry</button>
+          </div>
+        ) : shown.length === 0 ? (
           <EmptyState
             icon={<IcoReview size={56} />}
             title={emptyCopy[filter].title}

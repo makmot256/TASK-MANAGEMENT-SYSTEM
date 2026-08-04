@@ -171,7 +171,14 @@ router.get(
       row.peer_reviewers = await getPeerReviewersForSubmission(row.id);
     }
 
-    const badges = await similarityBadgesForIds(rows.map((r) => r.id));
+    // Similarity badges are a review hint — a failure (e.g. missing table, model
+    // down) must never take down the whole queue.
+    let badges = {};
+    try {
+      badges = await similarityBadgesForIds(rows.map((r) => r.id));
+    } catch (err) {
+      console.error('[review] similarity badges unavailable:', err.message);
+    }
     for (const row of rows) {
       row.similarity = badges[row.id] || null;
     }
