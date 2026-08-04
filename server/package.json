@@ -22,7 +22,6 @@
     "multer": "^2.0.1",
     "mysql2": "^3.11.4",
     "node-cron": "^4.2.1",
-    "nodemailer": "^9.0.1",
-    "task-management-system": "file:.."
+    "nodemailer": "^9.0.1"
   }
 }
