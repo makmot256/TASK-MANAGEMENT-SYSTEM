@@ -1,0 +1,14 @@
+[
+  "n_words",
+  "n_sents",
+  "avg_sent_len",
+  "avg_word_len",
+  "unique_word_ratio",
+  "double_space_count",
+  "missing_capital_starts",
+  "repeated_word_count",
+  "lowercase_i_count",
+  "no_terminal_punct",
+  "vague_phrase_count",
+  "filler_word_count"
+]

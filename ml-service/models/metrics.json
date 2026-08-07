@@ -1,0 +1,8 @@
+{
+  "grammar_quality_score": {
+    "loo_mae": 0.253
+  },
+  "content_quality_score": {
+    "loo_mae": 0.636
+  }
+}
