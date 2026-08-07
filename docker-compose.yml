@@ -1,0 +1,23 @@
+# Spins up MySQL 8 for the Task Management System.
+# Usage:  docker compose up -d
+# Matches the defaults in server/.env (root user, empty password, db name).
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: tms-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+      MYSQL_DATABASE: task_management_system
+    ports:
+      - "3306:3306"
+    volumes:
+      - tms_mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  tms_mysql_data:
