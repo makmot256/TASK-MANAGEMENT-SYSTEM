@@ -604,15 +604,22 @@ is independent of the process working directory.
 
 ### 10.2 Shared cPanel hosting
 
-Docker is unavailable on shared hosting, so the app runs natively under Passenger with
-cPanel's MySQL and cron. Two differences from every other topology matter:
+Docker is unavailable on shared hosting. The live deployment at `tasks.iot-ra.net` runs the
+app as a background Node process behind an Apache reverse proxy, supervised by a cron
+keepalive — **not** under Passenger, because the host installed Application Manager and
+`mod_passenger` without any `ea-nodejs` runtime, and Passenger's interpreter path cannot be
+overridden from `.htaccess`.
+
+Three constraints distinguish this topology from every other:
 
 - `UPLOAD_DIR` must be **absolute and outside `public_html`**, or Apache serves attachments
   directly and bypasses every scope check (undoing S1).
-- `RUN_SCHEDULER=false` plus a cPanel cron job, because Passenger stops an idle application
-  and an in-process timer would never fire.
+- `RUN_SCHEDULER=false` plus a cPanel cron job, since the app may be restarted at any time by
+  the keepalive.
+- The SPA build is uploaded separately — `client/dist` is gitignored.
 
-Full walkthrough: **[DEPLOYMENT-CPANEL.md](./DEPLOYMENT-CPANEL.md)**.
+Full walkthrough, the Passenger investigation, tradeoffs and the plan to retire the
+workaround: **[DEPLOYMENT-CPANEL.md](./DEPLOYMENT-CPANEL.md)**.
 
 ### 10.3 Host install
 
