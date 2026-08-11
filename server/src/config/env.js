@@ -1,5 +1,13 @@
 import dotenv from 'dotenv';
-dotenv.config();
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// Resolve .env relative to this file, not the working directory. Application
+// servers such as Passenger do not guarantee cwd is the application root, and a
+// silently unloaded .env means JWT_SECRET looks unset — which now refuses to
+// start in production, presenting as "could not be started" with no clue why.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.resolve(__dirname, '../../.env') });
 
 const num = (v, d) => (v === undefined || v === '' ? d : Number(v));
 
