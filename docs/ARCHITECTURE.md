@@ -602,7 +602,19 @@ and copied to `/app/client/dist`, preserving the `../../client/dist` path that
 `index.js` resolves. `UPLOAD_DIR` is set to the absolute `/app/uploads` so the named volume
 is independent of the process working directory.
 
-### 10.2 Host install
+### 10.2 Shared cPanel hosting
+
+Docker is unavailable on shared hosting, so the app runs natively under Passenger with
+cPanel's MySQL and cron. Two differences from every other topology matter:
+
+- `UPLOAD_DIR` must be **absolute and outside `public_html`**, or Apache serves attachments
+  directly and bypasses every scope check (undoing S1).
+- `RUN_SCHEDULER=false` plus a cPanel cron job, because Passenger stops an idle application
+  and an in-process timer would never fire.
+
+Full walkthrough: **[DEPLOYMENT-CPANEL.md](./DEPLOYMENT-CPANEL.md)**.
+
+### 10.3 Host install
 
 ```bash
 npm run install-all      # root + server + client

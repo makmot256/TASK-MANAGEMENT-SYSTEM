@@ -10,6 +10,7 @@ assignment, reporting, peer-review and performance-analytics platform.
 | [API.md](./API.md) | Every HTTP endpoint: method, path, role, payload, response, and the authorization scope applied |
 | [SCORING.md](./SCORING.md) | The Performance Index, the engagement engine, peer-reviewer assignment weighting, and every penalty rule — with worked examples |
 | [ISSUES.md](./ISSUES.md) | **All 31 findings — resolved.** Each keeps its original diagnosis and adds what was done and how it was verified |
+| [DEPLOYMENT-CPANEL.md](./DEPLOYMENT-CPANEL.md) | Deploying to shared cPanel hosting: Node.js Selector, database, migrations without shell access, cron, uploads placement, NGINX caching |
 
 For installation and day-to-day running, see the repository root:
 
