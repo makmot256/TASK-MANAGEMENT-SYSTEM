@@ -130,3 +130,91 @@ export async function recomputeAllEngagement() {
   }
   return { members: members.length, flaggedNew };
 }
+
+/**
+ * Engagement for many members in a fixed number of queries.
+ *
+ * P1: same motivation as computePerformanceForMembers — `/analytics/overview`
+ * and `/at-risk` looped the single-member version, which costs ~5 queries each.
+ */
+export async function computeEngagementForMembers(memberIds, settings) {
+  const out = new Map();
+  if (!memberIds.length) return out;
+  const s = settings || (await getSettings());
+  const ph = memberIds.map(() => '?').join(',');
+
+  const [history] = await pool.query(
+    `SELECT u.id,
+            DATEDIFF(NOW(), u.created_at) AS age_days,
+            (SELECT DATEDIFF(NOW(), MIN(al.created_at)) FROM activity_logs al
+              WHERE al.user_id = u.id) AS hist_days
+       FROM users u WHERE u.id IN (${ph})`,
+    memberIds
+  );
+  const [logins] = await pool.query(
+    `SELECT user_id, COUNT(DISTINCT DATE(created_at)) AS days FROM activity_logs
+      WHERE user_id IN (${ph}) AND action_type = 'login'
+        AND created_at > (NOW() - INTERVAL 14 DAY)
+      GROUP BY user_id`,
+    memberIds
+  );
+  const [updates] = await pool.query(
+    `SELECT user_id, COUNT(*) AS c FROM activity_logs
+      WHERE user_id IN (${ph}) AND action_type = 'task_update'
+        AND created_at > (NOW() - INTERVAL 14 DAY)
+      GROUP BY user_id`,
+    memberIds
+  );
+  const [subs] = await pool.query(
+    `SELECT member_id, COUNT(*) AS total, SUM(is_late = 0) AS on_time FROM submissions
+      WHERE member_id IN (${ph}) AND submitted_at > (NOW() - INTERVAL 30 DAY)
+      GROUP BY member_id`,
+    memberIds
+  );
+
+  const byId = (rows, key) => Object.fromEntries(rows.map((r) => [Number(r[key]), r]));
+  const histMap = byId(history, 'id');
+  const loginMap = byId(logins, 'user_id');
+  const updMap = byId(updates, 'user_id');
+  const subMap = byId(subs, 'member_id');
+  const threshold = Number(s.engagement_risk_threshold);
+
+  for (const rawId of memberIds) {
+    const id = Number(rawId);
+    const h = histMap[id];
+    const historyDays = Math.max(Number(h?.age_days) || 0, Number(h?.hist_days) || 0);
+    if (historyDays < 14) {
+      out.set(id, {
+        member_id: id, score: null, status: 'insufficient_data',
+        login_frequency: 0, task_update_frequency: 0, submission_timeliness: 0, is_flagged: 0,
+      });
+      continue;
+    }
+
+    const loginScore = clamp01((Number(loginMap[id]?.days) || 0) / 10) * 100;
+    const taskScore = clamp01((Number(updMap[id]?.c) || 0) / 7) * 100;
+    const sub = subMap[id];
+    const subTotal = Number(sub?.total) || 0;
+    const subScore = subTotal > 0 ? clamp01(Number(sub.on_time) / subTotal) * 100 : 0;
+
+    const score =
+      Number(s.eng_weight_login) * loginScore +
+      Number(s.eng_weight_task) * taskScore +
+      Number(s.eng_weight_submission) * subScore;
+
+    let status = 'on_track';
+    if (score < threshold) status = 'at_risk';
+    else if (score < threshold + 20) status = 'moderate';
+
+    out.set(id, {
+      member_id: id,
+      score: Math.round(score * 100) / 100,
+      status,
+      login_frequency: Math.round(loginScore * 100) / 100,
+      task_update_frequency: Math.round(taskScore * 100) / 100,
+      submission_timeliness: Math.round(subScore * 100) / 100,
+      is_flagged: status === 'at_risk' ? 1 : 0,
+    });
+  }
+  return out;
+}

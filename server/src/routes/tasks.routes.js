@@ -6,7 +6,7 @@ import { requireRole } from '../middleware/rbac.js';
 import { asyncHandler, HttpError } from '../middleware/error.js';
 import { notify, logActivity } from '../utils/notify.js';
 import { memberIdsForSupervisor } from '../utils/scope.js';
-import { upload, uploadRoot } from '../middleware/upload.js';
+import { upload, uploadRoot, unlinkUploaded } from '../middleware/upload.js';
 
 const router = Router();
 router.use(authenticate);
@@ -50,7 +50,9 @@ router.post(
 
     const files = req.files || [];
 
-    const taskId = await withTransaction(async (conn) => {
+    let taskId;
+    try {
+      taskId = await withTransaction(async (conn) => {
       const [result] = await conn.execute(
         `INSERT INTO tasks (title, description, priority, start_date, deadline, team_id, created_by)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -64,8 +66,9 @@ router.post(
           [id, memberId]
         );
         await conn.execute(
-          `INSERT INTO task_status_history (assignment_id, old_status, new_status, changed_by) VALUES (?, NULL, 'To-Do', ?)`,
-          [a.insertId, req.user.id]
+          `INSERT INTO task_status_history (assignment_id, task_id, member_id, old_status, new_status, changed_by)
+           VALUES (?, ?, ?, NULL, 'To-Do', ?)`,
+          [a.insertId, id, memberId, req.user.id]
         );
       }
 
@@ -85,7 +88,13 @@ router.post(
         );
       }
       return id;
-    });
+      });
+    } catch (err) {
+      // D4: multer writes to disk before the transaction opens, so a rollback
+      // would otherwise leave the files orphaned and unreferenced.
+      await unlinkUploaded(files);
+      throw err;
+    }
 
     const fileNote = files.length ? ` (${files.length} file${files.length === 1 ? '' : 's'} attached)` : '';
     for (const memberId of member_ids) {
@@ -249,8 +258,9 @@ router.patch(
       params
     );
     await pool.execute(
-      `INSERT INTO task_status_history (assignment_id, old_status, new_status, changed_by) VALUES (?, ?, ?, ?)`,
-      [a.id, a.status, status, req.user.id]
+      `INSERT INTO task_status_history (assignment_id, task_id, member_id, old_status, new_status, changed_by)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [a.id, req.params.id, req.user.id, a.status, status, req.user.id]
     );
     await logActivity(req.user.id, 'task_update', { taskId: req.params.id, status }, null);
     await notify(a.created_by, {
@@ -285,16 +295,41 @@ router.patch(
       );
 
       if (Array.isArray(member_ids)) {
-        if (member_ids.length === 0) throw new HttpError(400, 'Assign the task to at least one member.');
+        // D3: normalise once, up front. The two comparisons below used to be
+        // asymmetric — one coerced with Number(), the other did not — so a
+        // payload of strings made toRemove the entire current roster while toAdd
+        // correctly skipped them, unassigning everyone.
+        const requested = [...new Set(member_ids.map(Number).filter(Boolean))];
+        if (requested.length === 0) throw new HttpError(400, 'Assign the task to at least one member.');
+
         const [current] = await conn.execute(
           `SELECT member_id FROM task_assignments WHERE task_id = ?`,
           [taskId]
         );
-        const currentIds = current.map((r) => r.member_id);
-        const toAdd = member_ids.filter((m) => !currentIds.includes(Number(m)));
-        const toRemove = currentIds.filter((m) => !member_ids.includes(m));
+        const currentIds = current.map((r) => Number(r.member_id));
+        const toAdd = requested.filter((m) => !currentIds.includes(m));
+        const toRemove = currentIds.filter((m) => !requested.includes(m));
 
         for (const memberId of toRemove) {
+          // D1: task_assignments cascades to submissions, their files, every
+          // supervisor comment, every peer assessment on them, and the peer
+          // review obligations other members still owe. Removing an assignee who
+          // has submitted work therefore destroyed it irreversibly, from an
+          // editing action that reads as low-stakes.
+          const [[{ n }]] = await conn.query(
+            `SELECT COUNT(*) AS n FROM submissions s
+               JOIN task_assignments ta ON ta.id = s.assignment_id
+              WHERE ta.task_id = ? AND ta.member_id = ?`,
+            [taskId, memberId]
+          );
+          if (n > 0) {
+            const [[who]] = await conn.query(`SELECT full_name FROM users WHERE id = ?`, [memberId]);
+            throw new HttpError(
+              409,
+              `${who?.full_name || 'That member'} has already submitted work for this task and cannot be unassigned. ` +
+                'Delete the task instead if you really mean to discard it.'
+            );
+          }
           await conn.execute(`DELETE FROM task_assignments WHERE task_id = ? AND member_id = ?`, [taskId, memberId]);
         }
         for (const memberId of toAdd) {
@@ -303,8 +338,9 @@ router.patch(
             [taskId, memberId]
           );
           await conn.execute(
-            `INSERT INTO task_status_history (assignment_id, old_status, new_status, changed_by) VALUES (?, NULL, 'To-Do', ?)`,
-            [a.insertId, req.user.id]
+            `INSERT INTO task_status_history (assignment_id, task_id, member_id, old_status, new_status, changed_by)
+             VALUES (?, ?, ?, NULL, 'To-Do', ?)`,
+            [a.insertId, taskId, memberId, req.user.id]
           );
           await notify(memberId, {
             type: 'task_assigned',
@@ -316,16 +352,51 @@ router.patch(
       }
 
       if (Array.isArray(subtasks)) {
-        await conn.execute(`DELETE FROM subtasks WHERE task_id = ?`, [taskId]);
-        let pos = 0;
-        for (const st of subtasks) {
-          if (st && String(st).trim()) {
-            await conn.execute(`INSERT INTO subtasks (task_id, title, position) VALUES (?, ?, ?)`, [
-              taskId,
-              String(st).trim(),
-              pos++,
-            ]);
+        // D2: reconcile by id instead of delete-and-recreate. Subtasks used to be
+        // addressed by title string, so editing one typo silently un-checked the
+        // team's completed items and dropped every sub-assignment.
+        //
+        // Accepts { id?, title, is_done?, assigned_to? } and, for backwards
+        // compatibility, a bare string (treated as a new subtask).
+        const incoming = subtasks
+          .map((st) => (typeof st === 'string' ? { title: st } : st || {}))
+          .map((st) => ({
+            id: st.id ? Number(st.id) : null,
+            title: String(st.title ?? '').trim(),
+            is_done: st.is_done === undefined ? null : (st.is_done ? 1 : 0),
+            assigned_to: st.assigned_to === undefined ? undefined : (st.assigned_to ? Number(st.assigned_to) : null),
+          }))
+          .filter((st) => st.title);
+
+        const [existingSubtasks] = await conn.execute(
+          `SELECT id FROM subtasks WHERE task_id = ?`,
+          [taskId]
+        );
+        const existingIds = new Set(existingSubtasks.map((r) => Number(r.id)));
+        const keptIds = new Set(incoming.map((st) => st.id).filter((id) => id && existingIds.has(id)));
+
+        for (const row of existingSubtasks) {
+          if (!keptIds.has(Number(row.id))) {
+            await conn.execute(`DELETE FROM subtasks WHERE id = ?`, [row.id]);
           }
+        }
+
+        let pos = 0;
+        for (const st of incoming) {
+          if (st.id && existingIds.has(st.id)) {
+            const sets = ['title = ?', 'position = ?'];
+            const params = [st.title, pos];
+            if (st.is_done !== null) { sets.push('is_done = ?'); params.push(st.is_done); }
+            if (st.assigned_to !== undefined) { sets.push('assigned_to = ?'); params.push(st.assigned_to); }
+            params.push(st.id);
+            await conn.execute(`UPDATE subtasks SET ${sets.join(', ')} WHERE id = ?`, params);
+          } else {
+            await conn.execute(
+              `INSERT INTO subtasks (task_id, title, position, is_done, assigned_to) VALUES (?, ?, ?, ?, ?)`,
+              [taskId, st.title, pos, st.is_done ?? 0, st.assigned_to ?? null]
+            );
+          }
+          pos += 1;
         }
       }
     });
@@ -339,9 +410,28 @@ router.delete(
   '/:id',
   requireRole('supervisor', 'admin'),
   asyncHandler(async (req, res) => {
-    await pool.execute(`DELETE FROM tasks WHERE id = ? AND (created_by = ? OR ? = 'admin')`, [
+    // D6: this used to report success even when it matched zero rows, so a
+    // supervisor deleting someone else's task saw "Task deleted." and the item
+    // reappeared on refresh.
+    const [existing] = await pool.execute(`SELECT id FROM tasks WHERE id = ?`, [req.params.id]);
+    if (!existing.length) throw new HttpError(404, 'Task not found.');
+
+    // D4: remove the files from disk too. The row cascade never touched them.
+    const [files] = await pool.execute(
+      `SELECT stored_name FROM task_files WHERE task_id = ?
+        UNION ALL
+       SELECT sf.stored_name FROM submission_files sf
+         JOIN submissions s ON s.id = sf.submission_id
+        WHERE s.task_id = ?`,
+      [req.params.id, req.params.id]
+    );
+
+    const [r] = await pool.execute(`DELETE FROM tasks WHERE id = ? AND (created_by = ? OR ? = 'admin')`, [
       req.params.id, req.user.id, req.user.role,
     ]);
+    if (r.affectedRows === 0) throw new HttpError(403, 'You can only delete tasks you created.');
+
+    await unlinkUploaded(files.map((f) => ({ filename: f.stored_name })));
     res.json({ message: 'Task deleted.' });
   })
 );

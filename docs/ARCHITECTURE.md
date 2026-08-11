@@ -8,8 +8,10 @@ turns all of that activity into a Performance Index and an engagement risk signa
 - **Backend:** Node.js 18+ / Express 4, ESM modules, `mysql2` connection pool
 - **Frontend:** React 18 + TypeScript, Vite, React Router 6, Recharts, Axios
 - **Database:** MySQL 8 / MariaDB 10.4+, InnoDB, `utf8mb4`
-- **Async work:** in-process `node-cron` scheduler (no external queue or worker)
+- **Async work:** `node-cron`, in-process by default or a dedicated process (`RUN_SCHEDULER`)
 - **State:** stateless API; all state in MySQL and the filesystem (`server/uploads/`)
+- **Tests:** `node --test`, 38 tests, no test dependency added
+- **Local stack:** `docker compose up -d` — MySQL, schema, API and a Mailpit inbox
 
 ---
 
@@ -52,18 +54,19 @@ graph LR
     subgraph node["Node.js process :4000"]
         api["Express app<br/>src/index.js"]
         cron["node-cron scheduler<br/>jobs/scheduler.js"]
-        static["Static handlers<br/>/uploads + client/dist"]
+        static["Static handlers<br/>/uploads/avatars + client/dist"]
     end
 
     db[("MySQL :3306")]
-    disk[("uploads/")]
+    disk[("uploads/<br/><i>private</i>")]
+    avatars[("uploads/avatars/<br/><i>public</i>")]
 
     spa -- "JSON over /api/*<br/>Bearer JWT" --> api
     spa -. "dev only: Vite proxy" .-> api
     api --> db
     cron --> db
-    api --> disk
-    static --> disk
+    api -- "scope-checked download" --> disk
+    static --> avatars
     api --> static
 ```
 
@@ -122,7 +125,8 @@ graph TD
     end
 
     cfg["config/<br/>env.js · db.js (pool, withTransaction)"]
-    jobs["jobs/<br/>scheduler.js · runNow.js"]
+    jobs["jobs/<br/>scheduler.js · runNow.js · schedulerOnly.js"]
+    dbm["db/<br/>schema.sql · migrations.js<br/>triggers.js · setup.js"]
 
     idx --> routes
     idx --> jobs
@@ -134,6 +138,7 @@ graph TD
     jobs --> svc
     utils --> cfg
     mw --> cfg
+    dbm --> cfg
 ```
 
 ### Layer responsibilities
@@ -413,9 +418,14 @@ Three enforcement layers, applied in order:
 
 ```mermaid
 graph LR
-    A["1. authenticate<br/>valid JWT + active user row"] --> B["2. requireRole(...)<br/>coarse role gate"]
+    A["1. authenticate<br/>valid JWT + active user row<br/><i>+ idle window + must_reset</i>"] --> B["2. requireRole(...)<br/>coarse role gate"]
     B --> C["3. scope check<br/>row-level, per handler"]
 ```
+
+Layer 1 does more than verify a token. On every request it re-reads the user row (so a role
+change or deactivation takes effect immediately), rejects a session idle past
+`SESSION_IDLE_MINUTES`, and refuses every route but `/auth/me` and `/auth/change-password`
+while `must_reset` is set.
 
 **Layer 3 is where the real rules live.** There is no ORM-level tenancy filter; each handler
 asks `utils/scope.js` for the ids it may touch:
@@ -441,9 +451,9 @@ submission detail and file download by non-authors, since it derives from
 | Analytics | all members | members in their teams | only `/api/analytics/me` |
 | Peer review identity | full attribution | full attribution (`/analytics/peer-reviews`) | **anonymised** — `/api/peer/mine` returns scores and comments with no assessor |
 
-Peer-review anonymity is a **query-shape guarantee, not a schema guarantee**. The
-`peer_assessments` table stores `assessor_id`; the member-facing endpoint simply never
-selects it. The schema comment at `schema.sql:279` states this explicitly.
+Peer-review anonymity is now **structural**. `peer_assessments` still stores `assessor_id`,
+but member-facing handlers read the `peer_assessments_anon` view, which has no such column —
+so a careless `SELECT *` cannot de-anonymise a reviewer.
 
 ---
 
@@ -549,16 +559,50 @@ obligations, which (if missed) penalise TP, which lowers PI. Full formulas in
 
 ## 10. Deployment
 
+Two supported shapes: the **container stack** (`docker compose`, the default) and a
+**host install** (npm on a machine with its own MySQL).
+
+### 10.1 Container stack
+
 ```mermaid
 graph TB
-    subgraph single["Single host"]
-        n["node src/index.js<br/>:4000 — API + built SPA"]
-        u[("./uploads")]
-        m[("MySQL :3306<br/>local, or docker-compose")]
+    subgraph compose["docker compose"]
+        api["api — tms-app<br/>:4000 API + built SPA"]
+        setup["db-setup<br/><i>one-shot, runs to completion</i>"]
+        mp["mailpit<br/>:8025 inbox"]
+        m[("mysql 8.0<br/>tms_mysql_data")]
+        u[("tms_uploads")]
+        sch["scheduler<br/><i>profile: split-scheduler</i>"]
     end
-    n --- u
-    n --- m
+
+    setup -- "schema + settings + admin" --> m
+    api -- "depends_on: completed_successfully" --> setup
+    api --> m
+    api --> u
+    api -- SMTP --> mp
+    sch -.-> m
 ```
+
+```bash
+cp .env.example .env                 # optional — every value has a default
+docker compose up -d --build         # mysql → db-setup → api, on :4000
+docker compose --profile tools run --rm db-seed    # optional demo dataset
+docker compose --profile tools run --rm db-migrate # upgrade an existing volume
+docker compose --profile tools up adminer          # DB browser on :8080
+docker compose down                  # stop; volumes survive
+docker compose down -v               # stop and destroy data
+```
+
+`db-setup` is idempotent, so it re-runs harmlessly on every `up` and the API only starts
+once it has exited successfully. Password-reset and at-risk emails go to Mailpit at
+`http://localhost:8025` rather than the console, which makes those flows testable.
+
+The image is built from the repo root `Dockerfile`: the SPA is compiled in a builder stage
+and copied to `/app/client/dist`, preserving the `../../client/dist` path that
+`index.js` resolves. `UPLOAD_DIR` is set to the absolute `/app/uploads` so the named volume
+is independent of the process working directory.
+
+### 10.2 Host install
 
 ```bash
 npm run install-all      # root + server + client
@@ -579,38 +623,98 @@ cycle-based shape is detected, and back-fills settings rows).
 The design assumes a **single process**. Three things break under horizontal scaling:
 
 1. **The cron scheduler runs in-process** — N replicas means N nightly scoring runs, each
-   inserting duplicate snapshot rows and re-sending at-risk emails.
-2. **Uploads go to local disk** — replicas would not see each other's files.
+   inserting duplicate snapshot rows and re-sending at-risk emails. *Partly addressed:*
+   `RUN_SCHEDULER=false` disables the in-process cron, and `npm run jobs:scheduler`
+   (`jobs/schedulerOnly.js`, exposed as the `split-scheduler` compose profile) runs it as a
+   dedicated single process. There is still no leader election, so exactly one such process
+   may run.
+2. **Uploads go to local disk** — replicas would not see each other's files. The compose
+   stack puts them on a shared named volume, which covers replicas on one host but not
+   across hosts; object storage is still the real fix.
 3. **`connectionLimit: 10`** is per process, so DB connections multiply with replicas.
-
-Before scaling out: move the scheduler to a leader-elected or external trigger, and move
-uploads to object storage.
 
 ---
 
-## 11. Known gaps and technical debt
+## 11. Resolved issues and remaining constraints
 
-Recorded from reading the current code — not defects filed against a spec, but the things a
-new maintainer should know before changing anything.
+All 31 findings in **[ISSUES.md](./ISSUES.md)** and the eight design findings in
+**[DATA-MODEL.md](./DATA-MODEL.md#design-review)** have been fixed and verified. The
+architectural subset, and what replaced each:
 
-> The full, prioritised work list with evidence, reproduction steps and concrete fixes lives
-> in **[ISSUES.md](./ISSUES.md)** — 31 findings across security, scoring, data integrity,
-> performance and hygiene. The table below is the architectural subset.
+| # | Was | Now |
+| --- | --- | --- |
+| 1 | `/uploads` static-served with no auth | Two roots. Only `uploads/avatars/` is public; attachments are reachable only through the scope-checked download routes, and `/uploads/*` no longer falls through to the SPA. |
+| 2 | `SESSION_IDLE_MINUTES` read but never used | Enforced from server-side `users.last_seen_at`, throttled to one write a minute. |
+| 3 | `must_reset` set but never read | Gated in `middleware/auth.js`; only `/auth/me` and `/auth/change-password` stay reachable. |
+| 4 | `on_time` NULL on supervisor completion | Set from the *submission* timestamp, so review latency is not charged to the member. |
+| 5 | `performance_scores`, `task_status_history` write-only | Surfaced at `/api/analytics/trend/:id` and `/api/analytics/history/:taskId`. |
+| 6 | Analytics looped members × weeks | Set-based aggregates. Overview 66→18 queries, weekly 192→7. |
+| 7 | `PATCH /admin/users/:id` unvalidated | Validated against the enums; 400 instead of a raw 500. |
+| 8 | Anonymity was query-shape only | `peer_assessments_anon` view has no `assessor_id` column to leak. |
+| 9 | Multer files orphaned on rollback | `unlinkUploaded()` on rollback, rejection and task deletion. |
+| 10 | Task delete left files on disk | Attachments and briefings are removed with the rows. |
+| 11 | `evaluation_cycles` never driven | `currentCycleId()` guarantees one; admin endpoints open and close them; at most one may be open. |
+| 12 | `JWT_SECRET` fell back silently | Refuses to start outside development. |
 
-| # | Gap | Where | Impact |
-| --- | --- | --- | --- |
-| 1 | `/uploads` is served with `express.static` and **no auth**. Anyone who learns a `stored_name` can fetch a submission attachment directly, bypassing the scope-checked download routes. | `index.js:33` | Confidentiality. Filenames are `<timestamp>-<8 random bytes>` so not trivially guessable, but they leak via any shared URL. Fix: separate the avatar directory from the attachment directory, and static-serve only avatars. |
-| 2 | `SESSION_IDLE_MINUTES` is read into config and documented as "SRS 5.2: sessions expire after 30 min" but is **never used**. Session length is the JWT's 8h `expiresIn`. | `config/env.js:21` | Stated security control not implemented. |
-| 3 | `must_reset` is set to `1` on admin-created and admin-reset accounts, but **no login path checks it**. Users are never forced to change a temporary password. | `admin.routes.js:104,144` | Temporary passwords can live forever. |
-| 4 | `on_time` is set only when the *member* moves an assignment to `Completed`. Supervisor approval (`mark_completed`) leaves it `NULL`, so those completions count toward `completed` but never toward `on_time`. | `reports.routes.js:386`, `tasks.routes.js:243` | Depresses TP for members whose work is closed by a supervisor. |
-| 5 | `performance_scores` and `task_status_history` are **written but never read**. All analytics recompute live from source tables. | `performance.service.js:104`, `tasks.routes.js:252` | Dead storage; also means the nightly snapshot has no consumer. |
-| 6 | `/analytics/overview` and `/analytics/weekly` loop members × weeks with sequential awaited queries. `computeWeeklyForMember` issues 4 queries, so 20 members × 8 weeks ≈ 640 round-trips per page load. | `analytics.routes.js:179,263` | Latency grows linearly with team size. Fix: batch per-week aggregate queries with `GROUP BY member_id`. |
-| 7 | `PATCH /api/admin/users/:id` accepts `role` and `status` without validating them against the enums. | `admin.routes.js:119` | An invalid value surfaces as a raw MySQL 500 rather than a 400. |
-| 8 | Peer-review anonymity is enforced only by which columns each query selects. | `peer.routes.js:99` | One careless `SELECT *` on `peer_assessments` in a member-facing route de-anonymises reviewers. |
-| 9 | Multer writes files to disk before the enclosing transaction commits; a rollback orphans them. Replaced avatars are unlinked, but nothing else is. | `tasks.routes.js:53`, `reports.routes.js:46` | Slow disk growth. |
-| 10 | `DELETE /api/tasks/:id` relies on `ON DELETE CASCADE` down through assignments → submissions → files, but never removes the files from disk. | `tasks.routes.js:338` | Same as #9. |
-| 11 | `evaluation_cycles` exists and is referenced by collaboration ratings, but no endpoint creates, closes, or rotates a cycle — only the seed does. | `peer.routes.js:72` | With no open cycle, `cycle_id` is NULL, and MySQL treats NULLs as distinct in the unique key `(cycle_id, assessor_id, assessee_id, kind)` — so the upsert never fires and **duplicate collaboration ratings accumulate without limit**, each one counted in PE. See [ISSUES.md](./ISSUES.md#c1--duplicate-collaboration-ratings-inflate-peer-evaluation--high). |
-| 12 | The default `JWT_SECRET` falls back to `'dev_insecure_secret_change_me'` when unset, with no startup warning. | `config/env.js:19` | A deployment that forgets `.env` silently runs with a known signing key. |
+### Constraints that remain by design
+
+1. **The scheduler has no leader election.** `RUN_SCHEDULER=false` plus the dedicated
+   `jobs:scheduler` process makes splitting it safe, but nothing enforces that exactly one
+   runs. Correct for a single host; not for an autoscaled fleet.
+2. **Uploads are local disk.** A shared volume covers replicas on one host, not across hosts.
+3. **`connectionLimit: 10`** is per process, so connections still multiply with replicas —
+   though P1 cut the demand on that pool substantially.
+
+---
+
+## 11a. Database migrations
+
+```mermaid
+graph LR
+    fresh["new database"] --> setup["db:setup<br/><i>schema.sql + triggers + view</i>"]
+    setup --> ledger["records all migration ids<br/><i>so db:migrate is a no-op</i>"]
+    existing["existing database"] --> migrate["db:migrate"]
+    migrate --> pending["applies only unrecorded ids,<br/>in order, one at a time"]
+```
+
+`schema_migrations` records every applied migration id. `db/migrations.js` is append-only:
+never edit an id that has shipped, and reflect anything added there in `schema.sql` too. DDL
+is not transactional in MySQL, so each `up` is written to be re-runnable — a failure leaves
+earlier migrations recorded and the run resumes from the failure point.
+
+Three objects live outside `schema.sql` because of how it is executed:
+
+| Object | Why |
+| --- | --- |
+| Triggers (`db/triggers.js`) | `setup.js` runs `schema.sql` with `multipleStatements`, which splits on `;` — and a compound trigger body contains its own semicolons. |
+| `peer_assessments_anon` view | Declared in `schema.sql`, and re-created by migration `0013` for existing databases. |
+| The open evaluation cycle | Seeded by `db:setup`, guaranteed at write time by `currentCycleId()`. |
+
+---
+
+## 11b. Testing
+
+```bash
+npm --prefix server test                          # against a reachable MySQL
+docker compose --profile tools run --rm test      # against the compose MySQL
+```
+
+38 tests under `server/test/`, using the built-in `node --test` — no dependency added.
+
+| Suite | Covers |
+| --- | --- |
+| `performance.service.test.js` | Every penalty path, the clamping boundaries, the zero-data case, the SCORING.md worked example reproduced exactly, and a **C2 regression test** pinning both the fixed and the old broken behaviour |
+| `engagement.service.test.js` | The 14-day cold-start guard, each status band edge, both worked examples |
+| `scope.test.js` | The authorization boundaries — a supervisor must not see another team, cohorts exclude inactive members, no self-rating |
+| `password.test.js`, `profanity.test.js` | Pure functions; no database needed |
+
+Two design points worth knowing. Each DB-backed file builds **its own database**, because
+`node --test` runs files in parallel and a shared one had them dropping each other's schema
+mid-run. And availability is resolved with a **top-level await**, because `skip:` is evaluated
+when a test is *registered* — before any `before()` hook runs.
+
+The batched and per-member scoring paths are asserted to agree exactly, so the P1 optimisation
+cannot silently drift from the reference implementation.
 
 ---
 
@@ -625,4 +729,6 @@ new maintainer should know before changing anything.
 | Navigation or role menus | `client/src/components/Layout.tsx` (`NAV`) and `client/src/App.tsx` (`routesByRole`) |
 | Colours, spacing, dark mode | `client/src/styles/theme.css` |
 | The onboarding/splash sequence | `client/src/pages/auth/OnboardingFlow.tsx` |
-| Database shape | `db/schema.sql` for fresh installs **and** `db/migrate.js` for existing ones — both must be updated |
+| Database shape | `db/schema.sql` for fresh installs **and** a new numbered migration in `db/migrations.js` for existing ones — both must be updated |
+| A trigger | `db/triggers.js`, plus a migration that calls `applyTriggers` |
+| Scoring behaviour | The service, **and** the matching test in `server/test/` |

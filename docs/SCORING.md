@@ -46,8 +46,9 @@ graph LR
     SA --> PI
 ```
 
-The weights are **not** validated to sum to 1. They happen to, at the defaults; if an admin
-changes them so they don't, the result is simply clamped into `[0, 1]`.
+The weights **must** sum to 1.000 (±0.001) — `PUT /api/admin/settings` rejects any set that
+does not, naming the offending values. Previously they were unvalidated and simply clamped
+into `[0, 1]`, so a mistaken set quietly distorted every score.
 
 ### 1.1 TP — Task Performance
 
@@ -65,10 +66,15 @@ same as finishing nothing. The penalty term is where a member's *reviewer* oblig
 back into their own task score — miss a peer review deadline and your TP drops, permanently
 (missed rows are never cleared).
 
-> ⚠️ `on_time` is stamped only when the member themselves moves the assignment to
-> `Completed`. When a supervisor closes it via `mark_completed`, `on_time` stays NULL, so the
-> completion counts in the numerator of `completed / total` but not in `timeliness`. See
-> gap #4 in [ARCHITECTURE.md](./ARCHITECTURE.md#11-known-gaps-and-technical-debt).
+`on_time` is stamped on **both** completion paths. When a supervisor closes an assignment via
+`mark_completed`, it is judged against the **submission** timestamp rather than the approval
+timestamp — a member should not be marked late because their supervisor reviewed slowly.
+
+> This was the single most consequential bug in the system. Supervisor approval is the *normal*
+> path for any task that goes through review, and it used to leave `on_time` NULL — so a member
+> who submitted everything early and had it all approved scored `timeliness = 0`, hence
+> `TP = 0`, losing the full 0.25 weight. The members most engaged with the review workflow were
+> penalised hardest. See [C2](./ISSUES.md#c2--on_time-is-never-set-when-a-supervisor-completes-an-assignment--high).
 
 ### 1.2 PE — Peer Evaluation
 
@@ -150,7 +156,11 @@ lifetime formula. `computeWeeklyForMember` (`analytics.routes.js:82`) recomputes
 component from that week's rows only, with two deliberate differences:
 
 ```
-weekly_TP = clamp₀₁( (min(completed, 5) / 5) × (completed ? (timeliness || 0.5) : 0) )
+factor    = completed == 0        → 0            (nothing finished)
+          | on_time_known == 0    → 0.5          (finished, but timeliness unrecorded)
+          | otherwise             → on_time / on_time_known
+
+weekly_TP = clamp₀₁( (min(completed, 5) / 5) × factor )
 weekly_PE = (avg peer score / 5)×0.5 + (avg collab score / 5)×0.5     (window only)
 weekly_SA = (avg quality + (avg responsiveness || avg quality || 0)) / 10
 weekly_PI = null when the member had no activity at all that week
@@ -159,10 +169,11 @@ weekly_PI = null when the member had no activity at all that week
 - There is no denominator of "assigned", so TP is scored against a **fixed target of 5
   completions per week** rather than against the member's own workload.
 - Reviewer penalties are **not** applied weekly — they only appear in the lifetime PI.
-- `timeliness || 0.5` means a week with completions but **zero** on-time ones scores 0.5
-  rather than 0, because `0` is falsy in JavaScript. This mostly papers over NULL `on_time`
-  values from supervisor-closed tasks, but it does mean a fully-late week is not scored as
-  badly as the lifetime formula would score it.
+- A week with completions but **zero** on-time ones now scores 0, not 0.5. The previous
+  `timeliness || 0.5` was JavaScript falsy coalescing rather than a null check, so a
+  completely-late week was indistinguishable from one with no timeliness data — the chart
+  literally could not show a member missing every deadline. The 0.5 fallback survives only for
+  the genuine unknown, which C2 made rare.
 - Weeks are **Monday-start, UTC** (`weekStartUtc`), and `weeks` is clamped to 4–16.
 
 Treat weekly PI as a *trend indicator*, not a comparable value against the lifetime PI.
@@ -334,15 +345,22 @@ can see the `vulgar_comment` flag on any review via `/api/analytics/peer-reviews
 
 | Trigger | What runs | Persisted? |
 | --- | --- | --- |
+| `npm test` | Nothing — the suite asserts the formulas against fixtures | No |
 | Any analytics read | `computePerformanceForMember`, `computeEngagementForMember` | No — live only |
 | Member submits a peer review | `recomputePerformanceForMember` for the reviewer | ✅ `performance_scores` |
 | Nightly cron (`SCORING_CRON`, default `0 2 * * *`) | Mark overdue → recompute all performance → recompute all engagement + alerts | ✅ Both tables |
 | `POST /api/analytics/recompute` | Identical to the cron body | ✅ Both tables |
 | `npm --prefix server run jobs:run` | Performance + engagement only — **skips** marking overdue reviews | ✅ Both tables |
 
-Because reads always recompute, the snapshot tables are currently a write-only historical
-trail. `engagement_scores` has three real consumers (previous-flag comparison, team overview,
-reviewer weighting); `performance_scores` has none.
+Reads always recompute, so the snapshots are a historical trail rather than the source of
+truth. Both are now read: `engagement_scores` by the previous-flag comparison, the team
+overview and reviewer weighting; `performance_scores` by `GET /api/analytics/trend/:id`, which
+shows how a member's PI moved over time — the one thing live recomputation cannot produce.
+
+**Batched.** Analytics reads compute many members at once (`computePerformanceForMembers`,
+`computeEngagementForMembers`, `computeWeeklyBatch`) in a fixed number of queries rather than
+looping per member. The test suite asserts the batched and per-member paths agree exactly, so
+the optimisation cannot drift from the reference implementation.
 
 ---
 
@@ -362,8 +380,8 @@ All of these are live-editable at `PUT /api/admin/settings` and take effect on t
 
 Two caveats when retuning:
 
-1. Weights are **not** normalised. If you set all three PI weights to 1.0, every member with
-   any activity pins at PI = 1.0 after clamping.
+1. Weights are **validated, not normalised**. Each group must sum to 1.000 ±0.001 or the
+   write is rejected — you are told you made a mistake rather than having it quietly clamped.
 2. Penalty counts are cumulative over a member's lifetime. Lowering
    `peer_review_missed_penalty` reduces the deduction retroactively for everyone, because the
    multiplication happens at read time against the stored `missed` count.

@@ -3,14 +3,44 @@ import { pool } from '../config/db.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { asyncHandler, HttpError } from '../middleware/error.js';
-import { hashPassword, isStrongPassword } from '../utils/password.js';
+import { hashPassword, checkPasswordStrength } from '../utils/password.js';
 import { sendMail } from '../utils/mailer.js';
 import { notify } from '../utils/notify.js';
+import { getSettings } from '../services/settings.service.js';
 
 const router = Router();
 router.use(authenticate, requireRole('admin'));
 
 const PALETTE = ['#2563eb', '#7c3aed', '#0d9488', '#db2777', '#ea580c', '#16a34a', '#dc2626', '#0891b2'];
+
+// R3: these mirror the column ENUMs. Passing an unlisted value used to reach
+// MySQL and surface as a 500 with a database message.
+const ROLES = ['admin', 'supervisor', 'member'];
+const STATUSES = ['active', 'inactive', 'pending'];
+
+// S11: the system must always retain a way in. Nothing previously stopped the
+// only administrator demoting or deactivating themselves, which left no recovery
+// path short of direct SQL.
+async function assertNotLastAdmin(targetId, { role, status } = {}) {
+  const [[target]] = await pool.query(`SELECT id, role, status FROM users WHERE id = ?`, [targetId]);
+  if (!target || target.role !== 'admin' || target.status !== 'active') return;
+
+  const losingAdmin =
+    (role !== undefined && role !== 'admin') ||
+    (status !== undefined && status !== 'active') ||
+    (role === undefined && status === undefined); // deletion
+  if (!losingAdmin) return;
+
+  const [[{ c }]] = await pool.query(
+    `SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND status = 'active'`
+  );
+  if (Number(c) <= 1) {
+    throw new HttpError(
+      400,
+      'This is the last active administrator. Promote another administrator first.'
+    );
+  }
+}
 
 async function normalizeSupervisorIds(supervisorIds) {
   const ids = [...new Set((supervisorIds || []).map(Number).filter(Boolean))];
@@ -90,9 +120,9 @@ router.post(
   asyncHandler(async (req, res) => {
     const { full_name, email, role, password, phone, title } = req.body;
     if (!full_name || !email || !role) throw new HttpError(400, 'Full name, email and role are required.');
-    if (!['admin', 'supervisor', 'member'].includes(role)) throw new HttpError(400, 'Invalid role.');
-    if (!isStrongPassword(password))
-      throw new HttpError(400, 'Password must be at least 8 characters and include a letter and a number.');
+    if (!ROLES.includes(role)) throw new HttpError(400, 'Invalid role.');
+    const weak = checkPasswordStrength(password, email);
+    if (weak) throw new HttpError(400, weak);
 
     const [exists] = await pool.execute(`SELECT id FROM users WHERE email = ?`, [email]);
     if (exists.length) throw new HttpError(409, 'A user with that email already exists.');
@@ -120,6 +150,16 @@ router.patch(
   '/users/:id',
   asyncHandler(async (req, res) => {
     const { full_name, role, phone, title, status } = req.body;
+
+    // R3: validate against the enums before the value can reach MySQL.
+    if (role !== undefined && !ROLES.includes(role)) {
+      throw new HttpError(400, `Invalid role. Expected one of: ${ROLES.join(', ')}.`);
+    }
+    if (status !== undefined && !STATUSES.includes(status)) {
+      throw new HttpError(400, `Invalid status. Expected one of: ${STATUSES.join(', ')}.`);
+    }
+    await assertNotLastAdmin(req.params.id, { role, status });
+
     const fields = [];
     const params = [];
     if (full_name !== undefined) { fields.push('full_name = ?'); params.push(full_name); }
@@ -129,7 +169,9 @@ router.patch(
     if (status !== undefined) { fields.push('status = ?'); params.push(status); }
     if (!fields.length) throw new HttpError(400, 'Nothing to update.');
     params.push(req.params.id);
-    await pool.execute(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
+
+    const [r] = await pool.execute(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`, params);
+    if (r.affectedRows === 0) throw new HttpError(404, 'User not found.');
     res.json({ message: 'User updated.' });
   })
 );
@@ -139,7 +181,10 @@ router.post(
   '/users/:id/reset-password',
   asyncHandler(async (req, res) => {
     const { password } = req.body;
-    if (!isStrongPassword(password)) throw new HttpError(400, 'Password must be at least 8 characters and include a letter and a number.');
+    const [[target]] = await pool.query(`SELECT email FROM users WHERE id = ?`, [req.params.id]);
+    if (!target) throw new HttpError(404, 'User not found.');
+    const weak = checkPasswordStrength(password, target.email);
+    if (weak) throw new HttpError(400, weak);
     const hash = await hashPassword(password);
     await pool.execute(`UPDATE users SET password_hash = ?, must_reset = 1 WHERE id = ?`, [hash, req.params.id]);
     res.json({ message: 'Password reset. The user must change it on next login.' });
@@ -151,7 +196,9 @@ router.delete(
   '/users/:id',
   asyncHandler(async (req, res) => {
     if (Number(req.params.id) === req.user.id) throw new HttpError(400, 'You cannot delete your own account.');
-    await pool.execute(`DELETE FROM users WHERE id = ?`, [req.params.id]);
+    await assertNotLastAdmin(req.params.id);
+    const [r] = await pool.execute(`DELETE FROM users WHERE id = ?`, [req.params.id]);
+    if (r.affectedRows === 0) throw new HttpError(404, 'User not found.');
     res.json({ message: 'User deleted.' });
   })
 );
@@ -311,10 +358,58 @@ router.get(
   })
 );
 
+// Ranges every tunable must stay inside. Values outside these produced scores
+// that silently clamped rather than telling the admin they had made a mistake.
+const SETTING_BOUNDS = {
+  pi_weight_tp: [0, 1],
+  pi_weight_pe: [0, 1],
+  pi_weight_sa: [0, 1],
+  peer_penalty: [0, 1],
+  peer_review_deadline_days: [1, 90],
+  peer_review_missed_penalty: [0, 1],
+  peer_review_bad_penalty: [0, 1],
+  engagement_risk_threshold: [0, 100],
+  eng_weight_login: [0, 1],
+  eng_weight_task: [0, 1],
+  eng_weight_submission: [0, 1],
+};
+
+const WEIGHT_GROUPS = [
+  { name: 'Performance Index', keys: ['pi_weight_tp', 'pi_weight_pe', 'pi_weight_sa'] },
+  { name: 'Engagement', keys: ['eng_weight_login', 'eng_weight_task', 'eng_weight_submission'] },
+];
+
 router.put(
   '/settings',
   asyncHandler(async (req, res) => {
     const updates = req.body.settings || {};
+    if (!Object.keys(updates).length) throw new HttpError(400, 'No settings supplied.');
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (!(key in SETTING_BOUNDS)) throw new HttpError(400, `Unknown setting "${key}".`);
+      const n = Number(value);
+      if (!Number.isFinite(n)) throw new HttpError(400, `"${key}" must be a number.`);
+      const [min, max] = SETTING_BOUNDS[key];
+      if (n < min || n > max) throw new HttpError(400, `"${key}" must be between ${min} and ${max}.`);
+    }
+
+    // C5: weights are used directly and the result is clamped to [0,1], so a set
+    // that does not sum to 1 quietly distorts every score. Validate against the
+    // merged view, since a partial update can break the invariant on its own.
+    const current = await getSettings();
+    const merged = { ...current, ...Object.fromEntries(Object.entries(updates).map(([k, v]) => [k, Number(v)])) };
+    for (const group of WEIGHT_GROUPS) {
+      if (!group.keys.some((k) => k in updates)) continue;
+      const sum = group.keys.reduce((acc, k) => acc + Number(merged[k] || 0), 0);
+      if (Math.abs(sum - 1) > 0.001) {
+        throw new HttpError(
+          400,
+          `${group.name} weights must sum to 1.000 (got ${sum.toFixed(3)}: ` +
+            group.keys.map((k) => `${k}=${Number(merged[k] || 0)}`).join(', ') + ').'
+        );
+      }
+    }
+
     for (const [key, value] of Object.entries(updates)) {
       await pool.execute(
         `INSERT INTO system_settings (setting_key, setting_value) VALUES (?, ?)
@@ -323,6 +418,61 @@ router.put(
       );
     }
     res.json({ message: 'Settings saved.' });
+  })
+);
+
+// ---- Evaluation cycles -----------------------------------------------------
+// C1: collaboration ratings are keyed on the open cycle. Nothing used to create
+// or rotate one, so cycle_id stayed NULL and the unique key that was supposed to
+// hold one-rating-per-pair enforced nothing.
+
+router.get(
+  '/cycles',
+  asyncHandler(async (req, res) => {
+    const [cycles] = await pool.query(
+      `SELECT c.id, c.name, c.start_date, c.end_date, c.status, c.created_at,
+              (SELECT COUNT(*) FROM peer_assessments pa
+                WHERE pa.cycle_id = c.id AND pa.kind = 'collaboration') AS rating_count
+         FROM evaluation_cycles c ORDER BY c.id DESC`
+    );
+    res.json({ cycles });
+  })
+);
+
+router.post(
+  '/cycles',
+  asyncHandler(async (req, res) => {
+    const { name, start_date, end_date } = req.body;
+    if (!name || !String(name).trim()) throw new HttpError(400, 'Cycle name is required.');
+    if (!start_date || !end_date) throw new HttpError(400, 'Start and end dates are required.');
+    if (new Date(end_date) < new Date(start_date)) {
+      throw new HttpError(400, 'End date must be on or after the start date.');
+    }
+
+    // uq_cycle_single_open enforces this too; checking here produces a usable
+    // message instead of a duplicate-key error.
+    const [[open]] = await pool.query(`SELECT id, name FROM evaluation_cycles WHERE status = 'open' LIMIT 1`);
+    if (open) {
+      throw new HttpError(409, `"${open.name}" is still open. Close it before opening another cycle.`);
+    }
+
+    const [r] = await pool.execute(
+      `INSERT INTO evaluation_cycles (name, start_date, end_date, status) VALUES (?, ?, ?, 'open')`,
+      [String(name).trim(), start_date, end_date]
+    );
+    res.status(201).json({ id: r.insertId, message: 'Evaluation cycle opened.' });
+  })
+);
+
+router.post(
+  '/cycles/:id/close',
+  asyncHandler(async (req, res) => {
+    const [r] = await pool.execute(
+      `UPDATE evaluation_cycles SET status = 'closed' WHERE id = ? AND status = 'open'`,
+      [req.params.id]
+    );
+    if (r.affectedRows === 0) throw new HttpError(404, 'No open cycle with that id.');
+    res.json({ message: 'Evaluation cycle closed.' });
   })
 );
 

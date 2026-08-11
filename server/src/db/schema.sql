@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS users (
   must_reset    TINYINT(1)      NOT NULL DEFAULT 0,
   created_by    BIGINT UNSIGNED NULL,
   last_login_at DATETIME        NULL,
+  -- Idle-session enforcement (SRS 5.2). Refreshed at most once a minute.
+  last_seen_at  DATETIME        NULL,
   created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
@@ -72,7 +74,8 @@ CREATE TABLE IF NOT EXISTS teams (
   description   VARCHAR(400)    NULL,
   created_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  PRIMARY KEY (id)
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_team_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS team_supervisors (
@@ -181,21 +184,29 @@ CREATE TABLE IF NOT EXISTS task_assignments (
   UNIQUE KEY uq_assignment (task_id, member_id),
   KEY idx_assign_member (member_id),
   KEY idx_assign_status (status),
+  -- Serves the weekly TP aggregate: member + status + completed_at range.
+  KEY idx_assign_member_status_completed (member_id, status, completed_at),
   CONSTRAINT fk_assign_task   FOREIGN KEY (task_id)   REFERENCES tasks (id) ON DELETE CASCADE,
   CONSTRAINT fk_assign_member FOREIGN KEY (member_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Immutable audit of every status change (timestamps drive analytics)
+-- An audit a routine edit can erase is not an audit: assignment_id is nullable
+-- and ON DELETE SET NULL, and task_id/member_id are denormalised so a row stays
+-- interpretable after its assignment is gone.
 CREATE TABLE IF NOT EXISTS task_status_history (
   id            BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-  assignment_id BIGINT UNSIGNED NOT NULL,
+  assignment_id BIGINT UNSIGNED NULL,
+  task_id       BIGINT UNSIGNED NULL,
+  member_id     BIGINT UNSIGNED NULL,
   old_status    VARCHAR(20)     NULL,
   new_status    VARCHAR(20)     NOT NULL,
   changed_by    BIGINT UNSIGNED NULL,
   changed_at    DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_history_assignment (assignment_id),
-  CONSTRAINT fk_history_assignment FOREIGN KEY (assignment_id) REFERENCES task_assignments (id) ON DELETE CASCADE,
+  KEY idx_history_task (task_id, changed_at),
+  CONSTRAINT fk_history_assignment FOREIGN KEY (assignment_id) REFERENCES task_assignments (id) ON DELETE SET NULL,
   CONSTRAINT fk_history_user       FOREIGN KEY (changed_by)    REFERENCES users (id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -218,6 +229,8 @@ CREATE TABLE IF NOT EXISTS submissions (
   KEY idx_sub_task (task_id),
   KEY idx_sub_member (member_id),
   KEY idx_sub_assignment (assignment_id),
+  -- Serves engagement feature 3: member + submitted_at range.
+  KEY idx_sub_member_submitted (member_id, submitted_at),
   CONSTRAINT fk_sub_task       FOREIGN KEY (task_id)       REFERENCES tasks (id) ON DELETE CASCADE,
   CONSTRAINT fk_sub_assignment FOREIGN KEY (assignment_id) REFERENCES task_assignments (id) ON DELETE CASCADE,
   CONSTRAINT fk_sub_member     FOREIGN KEY (member_id)     REFERENCES users (id) ON DELETE CASCADE,
@@ -271,8 +284,12 @@ CREATE TABLE IF NOT EXISTS evaluation_cycles (
   end_date   DATE            NOT NULL,
   status     ENUM('open','closed') NOT NULL DEFAULT 'open',
   created_at DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  -- NULL for closed cycles, so the unique key permits many closed rows but only
+  -- one open one. Collaboration scoring depends on "the" open cycle existing.
+  open_flag  TINYINT UNSIGNED AS (IF(status = 'open', 1, NULL)) STORED,
   PRIMARY KEY (id),
-  KEY idx_cycle_status (status)
+  KEY idx_cycle_status (status),
+  UNIQUE KEY uq_cycle_single_open (open_flag)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Peer (cohort-wide) and Collaboration (immediate teammates) assessments.
@@ -293,7 +310,16 @@ CREATE TABLE IF NOT EXISTS peer_assessments (
   UNIQUE KEY uq_assess_submission (submission_id, assessor_id),
   KEY idx_assess_assessee (assessee_id),
   CONSTRAINT chk_assess_score CHECK (score BETWEEN 1 AND 5),
-  CONSTRAINT fk_assess_cycle      FOREIGN KEY (cycle_id)      REFERENCES evaluation_cycles (id) ON DELETE SET NULL,
+  -- Each kind has exactly one parent: peer_review hangs off a submission,
+  -- collaboration off an evaluation cycle. Neither-or-both is now unrepresentable.
+  CONSTRAINT chk_assess_parent CHECK (
+    (kind = 'peer_review'   AND submission_id IS NOT NULL AND cycle_id IS NULL) OR
+    (kind = 'collaboration' AND cycle_id      IS NOT NULL AND submission_id IS NULL)
+  ),
+  -- RESTRICT, not SET NULL: a collaboration rating now requires its cycle, so
+  -- nulling the column would violate chk_assess_parent. MySQL also forbids a
+  -- CHECK on a column carrying a SET NULL referential action.
+  CONSTRAINT fk_assess_cycle      FOREIGN KEY (cycle_id)      REFERENCES evaluation_cycles (id),
   CONSTRAINT fk_assess_submission FOREIGN KEY (submission_id) REFERENCES submissions (id) ON DELETE CASCADE,
   CONSTRAINT fk_assess_assessor   FOREIGN KEY (assessor_id)   REFERENCES users (id) ON DELETE CASCADE,
   CONSTRAINT fk_assess_assessee   FOREIGN KEY (assessee_id)   REFERENCES users (id) ON DELETE CASCADE
@@ -305,7 +331,6 @@ CREATE TABLE IF NOT EXISTS peer_review_assignments (
   submission_id BIGINT UNSIGNED NOT NULL,
   reviewer_id   BIGINT UNSIGNED NOT NULL,
   reviewee_id   BIGINT UNSIGNED NOT NULL,
-  kind          ENUM('peer_review','collaboration') NOT NULL DEFAULT 'peer_review',
   status        ENUM('pending','completed','missed') NOT NULL DEFAULT 'pending',
   assigned_at   DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   due_at        DATETIME        NULL,
@@ -326,12 +351,14 @@ CREATE TABLE IF NOT EXISTS supervisor_assessments (
   submission_id        BIGINT UNSIGNED NOT NULL,
   member_id            BIGINT UNSIGNED NOT NULL,
   supervisor_id        BIGINT UNSIGNED NOT NULL,
-  quality_score        TINYINT UNSIGNED NOT NULL,  -- 0..5
-  responsiveness_score TINYINT UNSIGNED NULL,      -- 0..5 (derived from turnaround)
+  quality_score        TINYINT UNSIGNED NOT NULL,
+  responsiveness_score TINYINT UNSIGNED NULL,
   created_at           DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   KEY idx_sa_member (member_id),
   KEY idx_sa_submission (submission_id),
+  CONSTRAINT chk_sa_quality        CHECK (quality_score BETWEEN 0 AND 5),
+  CONSTRAINT chk_sa_responsiveness CHECK (responsiveness_score IS NULL OR responsiveness_score BETWEEN 0 AND 5),
   CONSTRAINT fk_sa_submission FOREIGN KEY (submission_id) REFERENCES submissions (id) ON DELETE CASCADE,
   CONSTRAINT fk_sa_member     FOREIGN KEY (member_id)     REFERENCES users (id) ON DELETE CASCADE,
   CONSTRAINT fk_sa_supervisor FOREIGN KEY (supervisor_id) REFERENCES users (id) ON DELETE CASCADE
@@ -341,7 +368,6 @@ CREATE TABLE IF NOT EXISTS supervisor_assessments (
 CREATE TABLE IF NOT EXISTS performance_scores (
   id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   member_id       BIGINT UNSIGNED NOT NULL,
-  cycle_id        BIGINT UNSIGNED NULL,
   tp              DECIMAL(6,4)    NOT NULL DEFAULT 0,
   pe              DECIMAL(6,4)    NOT NULL DEFAULT 0,
   sa              DECIMAL(6,4)    NOT NULL DEFAULT 0,
@@ -352,8 +378,7 @@ CREATE TABLE IF NOT EXISTS performance_scores (
   PRIMARY KEY (id),
   KEY idx_perf_member (member_id),
   KEY idx_perf_computed (computed_at),
-  CONSTRAINT fk_perf_member FOREIGN KEY (member_id) REFERENCES users (id) ON DELETE CASCADE,
-  CONSTRAINT fk_perf_cycle  FOREIGN KEY (cycle_id)  REFERENCES evaluation_cycles (id) ON DELETE SET NULL
+  CONSTRAINT fk_perf_member FOREIGN KEY (member_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- ============================================================================
@@ -364,14 +389,15 @@ CREATE TABLE IF NOT EXISTS performance_scores (
 CREATE TABLE IF NOT EXISTS activity_logs (
   id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   user_id     BIGINT UNSIGNED NOT NULL,
-  action_type ENUM('login','task_update','submission','comment','view','peer_review') NOT NULL,
+  action_type ENUM('login','task_update','submission','comment','peer_review','profile_update') NOT NULL,
   meta        JSON            NULL,
   ip_address  VARCHAR(64)     NULL,
   created_at  DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
-  KEY idx_activity_user (user_id),
   KEY idx_activity_created (created_at),
-  KEY idx_activity_type (action_type),
+  -- One composite serving all three engagement feature queries, which filter on
+  -- user + type + window together.
+  KEY idx_activity_user_type_created (user_id, action_type, created_at),
   CONSTRAINT fk_activity_user FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -424,4 +450,29 @@ CREATE TABLE IF NOT EXISTS system_settings (
   UNIQUE KEY uq_setting_key (setting_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- ============================================================================
+--  MODULE 10 : MIGRATION LEDGER
+--  Records which numbered migrations have been applied, so `db:migrate` is
+--  resumable and a database can report its own version.
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  id         VARCHAR(80)  NOT NULL,
+  applied_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 SET FOREIGN_KEY_CHECKS = 1;
+
+-- ============================================================================
+--  VIEWS
+--  S7: anonymity used to be a property of which columns each query happened to
+--  select. One careless SELECT * in a member-facing route would have
+--  de-anonymised every reviewer retroactively. Member-scoped handlers read this
+--  view instead, which has no assessor_id to leak.
+-- ============================================================================
+
+CREATE OR REPLACE VIEW peer_assessments_anon AS
+SELECT id, submission_id, cycle_id, assessee_id, kind, score, comment,
+       vulgar_comment, created_at
+  FROM peer_assessments;

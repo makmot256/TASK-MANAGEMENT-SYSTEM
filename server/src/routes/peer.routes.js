@@ -16,6 +16,37 @@ import { recomputePerformanceForMember } from '../services/performance.service.j
 const router = Router();
 router.use(authenticate);
 
+/**
+ * C1: returns the id of the open evaluation cycle, opening one if none exists.
+ *
+ * Previously this fell back to NULL, and because MySQL treats NULLs as distinct
+ * in a unique index, uq_assessment enforced nothing — every re-rating inserted a
+ * new row and Peer Evaluation could be inflated without limit. The schema now
+ * also rejects a collaboration rating with no cycle, so this is the only way a
+ * rating can be written at all.
+ */
+async function currentCycleId() {
+  const [rows] = await pool.execute(
+    `SELECT id FROM evaluation_cycles WHERE status = 'open' ORDER BY id DESC LIMIT 1`
+  );
+  if (rows.length) return rows[0].id;
+
+  try {
+    const [r] = await pool.execute(
+      `INSERT INTO evaluation_cycles (name, start_date, end_date, status)
+       VALUES (CONCAT('Cycle ', DATE_FORMAT(CURDATE(), '%Y-%m')), CURDATE(), LAST_DAY(CURDATE()), 'open')`
+    );
+    return r.insertId;
+  } catch (err) {
+    // uq_cycle_single_open means a concurrent request may have won the race.
+    const [again] = await pool.execute(
+      `SELECT id FROM evaluation_cycles WHERE status = 'open' ORDER BY id DESC LIMIT 1`
+    );
+    if (again.length) return again[0].id;
+    throw err;
+  }
+}
+
 // GET /api/peer/assigned  (submission-based reviews this member must complete)
 router.get(
   '/assigned',
@@ -69,10 +100,7 @@ router.post(
       throw new HttpError(403, 'You can only rate members on your team.');
     }
 
-    const [cycles] = await pool.execute(
-      `SELECT id FROM evaluation_cycles WHERE status = 'open' ORDER BY id DESC LIMIT 1`
-    );
-    const cycleId = cycles[0]?.id || null;
+    const cycleId = await currentCycleId();
 
     await pool.execute(
       `INSERT INTO peer_assessments (cycle_id, assessor_id, assessee_id, kind, score, comment)
@@ -91,15 +119,17 @@ router.get(
   '/mine',
   requireRole('member'),
   asyncHandler(async (req, res) => {
+    // S7: peer_assessments_anon has no assessor_id column at all, so anonymity
+    // survives a careless SELECT * here rather than depending on this list.
     const [agg] = await pool.execute(
-      `SELECT kind, AVG(score) AS avg_score, COUNT(*) AS n FROM peer_assessments
+      `SELECT kind, AVG(score) AS avg_score, COUNT(*) AS n FROM peer_assessments_anon
        WHERE assessee_id = ? GROUP BY kind`,
       [req.user.id]
     );
     const [comments] = await pool.execute(
       `SELECT pa.kind, pa.score, pa.comment, pa.created_at, pa.submission_id,
               t.id AS task_id, t.title AS task_title
-         FROM peer_assessments pa
+         FROM peer_assessments_anon pa
          LEFT JOIN submissions s ON s.id = pa.submission_id
          LEFT JOIN tasks t ON t.id = s.task_id
         WHERE pa.assessee_id = ?

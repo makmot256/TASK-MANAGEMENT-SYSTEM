@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { recomputeAllPerformance } from '../services/performance.service.js';
 import { recomputeAllEngagement } from '../services/engagement.service.js';
 import { markOverduePeerReviews } from '../services/peer-penalty.service.js';
+import { retryMissingPeerAssignments } from '../services/peer-assignment.service.js';
 import { getSettings } from '../services/settings.service.js';
 
 export function startScheduler() {
@@ -15,10 +16,14 @@ export function startScheduler() {
     try {
       const settings = await getSettings();
       const overdue = await markOverduePeerReviews(settings);
+      // R2: repair submissions whose reviewer assignment failed at write time.
+      const retried = await retryMissingPeerAssignments();
       const perf = await recomputeAllPerformance();
       const eng = await recomputeAllEngagement();
       console.log(
-        `[scheduler] scoring done in ${Date.now() - started}ms - missed-reviews:${overdue.marked}, performance:${perf} members, engagement newly-flagged:${eng.flaggedNew}`
+        `[scheduler] scoring done in ${Date.now() - started}ms - ` +
+          `missed-reviews:${overdue.marked}, peer-assign-repaired:${retried.repaired}, ` +
+          `performance:${perf} members, engagement newly-flagged:${eng.flaggedNew}`
       );
     } catch (err) {
       console.error('[scheduler] scoring failed:', err.message);

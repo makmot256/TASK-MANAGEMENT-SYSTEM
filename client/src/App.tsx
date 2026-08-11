@@ -3,6 +3,7 @@ import { Routes, Route, Navigate } from 'react-router-dom';
 import { useAuth } from './context/AuthContext';
 import Layout from './components/Layout';
 import OnboardingFlow from './pages/auth/OnboardingFlow';
+import ForcePasswordChange from './pages/auth/ForcePasswordChange';
 import ResetPassword from './pages/ResetPassword';
 import Profile from './pages/Profile';
 
@@ -72,6 +73,13 @@ export default function App() {
       </>
     ),
   };
+
+  // S6: a temporary password must be changed before anything else is reachable.
+  // The server enforces this independently, so this is the usable path through
+  // the gate rather than the gate itself.
+  if (user && user.must_reset) {
+    return <ForcePasswordChange />;
+  }
 
   return (
     <OnboardingFlow>

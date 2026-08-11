@@ -16,6 +16,9 @@ The token comes from `POST /api/auth/login`, is signed with `JWT_SECRET`, expire
 **not** trust the role claim — it re-reads the user row on every request, so deactivating an
 account takes effect immediately.
 
+Beyond expiry, a session also ends after `SESSION_IDLE_MINUTES` (default 30) of inactivity,
+tracked server-side in `users.last_seen_at`.
+
 **Content type.** JSON in, JSON out, except the four multipart endpoints marked
 `multipart/form-data`.
 
@@ -31,9 +34,18 @@ account takes effect immediately.
 | 401 | Missing/invalid token, or wrong credentials |
 | 403 | Wrong role, or outside your data scope, or inactive account |
 | 404 | Not found |
-| 409 | Conflict (duplicate email) |
-| 413 | Upload too large or too many files |
+| 409 | Conflict (duplicate email, unassigning a member with submitted work, a cycle already open) |
+| 413 | Upload too large, too many files, or storage quota exceeded |
+| 429 | Too many failed login attempts |
 | 503 | Database unreachable |
+
+**Machine-readable codes.** Two 4xx responses carry a `code` so the client can react rather
+than just display text:
+
+| `code` | Status | Meaning |
+| --- | --- | --- |
+| `must_reset` | 403 | The account still has a temporary password. Only `GET /auth/me` and `PATCH /auth/change-password` are reachable until it is changed. |
+| `session_idle` | 401 | The session exceeded `SESSION_IDLE_MINUTES` of inactivity. The JWT may still be within its expiry. |
 
 **Role column** below means the role gate (`requireRole`). *Scope* describes the row-level
 check applied on top of it.
@@ -65,7 +77,13 @@ check applied on top of it.
 { "email": "grace@tms.local", "password": "Password@123" }
 ```
 
-→ `200 { "token": "...", "user": { id, full_name, email, role, ... } }`
+→ `200 { "token": "...", "user": { id, full_name, email, role, must_reset, ... } }`
+
+**Throttled.** 10 failed attempts for one email, or 30 from one IP address, inside a
+15-minute window return `429`. The per-IP cap catches one attacker spraying many accounts,
+which a per-account cap alone misses. Limits are configurable via
+`LOGIN_MAX_FAILURES_PER_ACCOUNT`, `LOGIN_MAX_FAILURES_PER_IP` and
+`LOGIN_FAILURE_WINDOW_MINUTES`.
 
 Every attempt — success or failure — is written to `login_audit` with IP and user-agent
 before any response is returned, so failures are always recorded. On success: `last_login_at` is stamped and a `login` row lands
@@ -84,13 +102,21 @@ unlinks the previous file. → `{ message, user }`
 { "currentPassword": "...", "newPassword": "..." }
 ```
 
-New password must be ≥8 chars with at least one letter and one digit. Clears `must_reset`.
+New password must satisfy the strength policy: **at least 12 characters**, not a common
+password or a substring of one, no run of 4+ identical characters, no 5+ character keyboard or
+alphabet sequence, and it may not contain the email local part or match the current password.
+The response message names the specific rule that failed. Clears `must_reset`.
 
 ### POST `/forgot-password`
 
 Always returns the same message whether or not the email exists — no account enumeration.
 When it does exist, a 24-byte hex token valid for one hour is stored and emailed (or logged
 to the console when SMTP is unconfigured).
+
+The link is built from `PUBLIC_URL` (falling back to `CLIENT_ORIGIN`), **never** from the
+request's `Origin` header — that header is attacker-supplied, and deriving the link from it
+allowed anyone to have the real system email a victim a link to their own domain carrying a
+valid token. The raw token no longer appears in the body either.
 
 ### POST `/reset-password`
 
@@ -120,15 +146,18 @@ Every route here is `authenticate + requireRole('admin')`, applied at the router
 
 ```json
 { "full_name": "Grace N.", "email": "grace@tms.local",
-  "role": "member", "password": "Password@123",
+  "role": "member", "password": "Winter-Marble-92",
   "phone": "0700000000", "title": "Field Officer" }
 ```
 
 Creates the account as `active` with `must_reset = 1`, assigns a random avatar colour, and
 emails a welcome notice. → `201 { id, message }`. `409` if the email is taken.
 
-> `PATCH /users/:id` does not validate `role`/`status` against their enums — an invalid value
-> produces a raw 500 rather than a 400.
+`PATCH /users/:id` validates `role` and `status` against their enums, returning 400 with the
+permitted values.
+
+**Last-administrator guard.** Demoting, deactivating or deleting the only remaining active
+administrator returns 400. Without it there was no recovery path short of direct SQL.
 
 ### Teams
 
@@ -152,6 +181,24 @@ emails a welcome notice. → `201 { id, message }`. `409` if the email is taken.
 | PUT | `/settings` | `{ settings: { key: value, ... } }` — upsert; takes effect on the next scoring read, no restart |
 | GET | `/audit` | Latest 100 login attempts with the user's name |
 | GET | `/health` | Row counts for 7 tables, users by role, uptime, 24h login success/failure counts |
+
+`PUT /settings` validates every key against a bounds table and requires each weight group —
+the three `pi_weight_*` and the three `eng_weight_*` — to sum to **1.000 ±0.001**, checked
+against the merged view so a partial update cannot break the invariant. Unknown keys are
+rejected.
+
+### Evaluation cycles
+
+Collaboration ratings are scoped to the open cycle. Nothing used to create one, so `cycle_id`
+stayed NULL and the unique key meant to hold one-rating-per-pair enforced nothing.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| GET | `/cycles` | All cycles, newest first, each with its collaboration `rating_count` |
+| POST | `/cycles` | `{ name, start_date, end_date }` — `409` if a cycle is already open |
+| POST | `/cycles/:id/close` | `404` if that id is not currently open |
+
+At most one cycle may be open, enforced by a UNIQUE key over a generated column.
 
 ---
 
@@ -259,7 +306,7 @@ of the same task** — that is how a member subdivides work with a teammate.
 | --- | --- |
 | `task_id` | Required; you must hold an assignment on it |
 | `content` | Report text — required *unless* files are attached |
-| `files` | Up to 10 PDF/DOCX, ≤`MAX_UPLOAD_MB` each |
+| `files` | Up to `MAX_UPLOAD_FILES` (10) PDF/DOCX, ≤`MAX_UPLOAD_MB` (25) each, within the member's `MEMBER_STORAGE_QUOTA_MB` (500) total |
 | `kind` | `daily_log` or `weekly_report` (default) |
 | `revision_of` | Id of the submission being revised |
 
@@ -302,8 +349,9 @@ otherwise 1.
 
 - `request_revision` → stamps `revision_requested_at`, sends the assignment back to
   `In Progress`, notifies the member
-- `mark_completed` → assignment becomes `Completed` (note: this path does **not** set
-  `on_time`)
+- `mark_completed` → assignment becomes `Completed`, and `on_time` is set by comparing the
+  **submission** timestamp against the task deadline. Judging against the submission rather
+  than the approval means a member is not marked late because their supervisor reviewed slowly
 
 ---
 
@@ -369,6 +417,8 @@ No assessor identity appears anywhere in this payload — that is the anonymity 
 | GET | `/peer-assignments` | supervisor, admin |
 | GET | `/me` | member |
 | POST | `/recompute` | supervisor, admin |
+| GET | `/trend/:id` | any (own, or in scope) |
+| GET | `/history/:taskId` | any (assignee, creator, or in scope) |
 
 Supervisors are scoped to members of teams they supervise; admins see all members. Requesting
 a member or team outside your scope returns `403 "Not in your scope."`
@@ -382,8 +432,10 @@ Each member carries live `performance` (TP/PE/SA/PI + penalty breakdown), `engag
 team with per-team averages. `cohort` gives the scope-wide averages and at-risk / on-track
 counts. `weights` echoes the current settings so the UI can explain the numbers.
 
-> Scores are computed **live per request**, in a loop over members. Expect latency to grow
-> with team size.
+Scores are computed live per request, but in **set-based batches** rather than a loop:
+`computePerformanceForMembers` and `computeEngagementForMembers` cover any number of members
+in a fixed number of queries. For six members this endpoint issues 18 queries; the previous
+per-member loop issued roughly 11 each.
 
 ### GET `/weekly`
 
@@ -391,6 +443,9 @@ counts. `weights` echoes the current settings so the UI can explain the numbers.
 `avg_pi/tp/pe/sa`, `completed_tasks`, `active_members`, and a per-member breakdown. Weekly TP
 uses a different formula from the lifetime one — see
 [SCORING.md](./SCORING.md#weekly-scores-are-a-different-formula).
+
+Four queries total, regardless of member count or week count — an 8-week window over six
+members costs 7 queries in all, where the previous implementation issued roughly 192.
 
 ### GET `/member/:id`
 
@@ -414,7 +469,22 @@ Runs the full pipeline on demand: mark overdue reviews as `missed`, recompute an
 performance for all members, recompute and snapshot engagement (sending at-risk alerts for
 newly flagged members).
 
-→ `{ message, missed_reviews_marked, performance_members, engagement }`
+→ `{ message, missed_reviews_marked, peer_assignments_repaired, performance_members, engagement }`
+
+`peer_assignments_repaired` counts submissions that had no peer reviewers — because selection
+threw at submission time — and were successfully assigned on this pass.
+
+### GET `/trend/:id`
+
+→ `{ member_id, days, snapshots[] }` — one `performance_scores` snapshot per day (the latest
+of that day), for the last `days` (7–365, default 90). This is the one view live recomputation
+cannot produce: how a member's PI moved over time. Members may request their own only.
+
+### GET `/history/:taskId`
+
+→ `{ task_id, history[] }` — the `task_status_history` timeline for a task, each entry with
+`old_status`, `new_status`, `changed_at`, the member it belongs to, and who changed it.
+Assignees, the creating supervisor, in-scope supervisors and admins may read it.
 
 ---
 
@@ -449,10 +519,17 @@ back in ascending order. Bodies are capped at 2000 characters.
 
 | Path | Auth | Contents |
 | --- | --- | --- |
-| `/uploads/<stored_name>` | **none** | Avatars, task briefings, and submission attachments — all in one directory |
+| `/uploads/avatars/<stored_name>` | **none** | Profile images only |
+| `/uploads/<stored_name>` | — | **Not served.** Returns 404 |
 
-Attachments should be fetched through the scope-checked endpoints
-(`/api/tasks/:taskId/files/:fileId`, `/api/submissions/:id/files/:fileId`), which the SPA does
-via `downloadFile()` so the JWT header is sent. The unauthenticated static mount exists for
-avatars but currently exposes the same directory — see gap #1 in
-[ARCHITECTURE.md](./ARCHITECTURE.md#11-known-gaps-and-technical-debt).
+Task briefings and submission attachments live in the private root and are reachable **only**
+through the scope-checked endpoints (`/api/tasks/:taskId/files/:fileId`,
+`/api/submissions/:id/files/:fileId`), which the SPA uses via `downloadFile()` so the JWT
+header is sent.
+
+The SPA fallback deliberately does not answer `/uploads/*`: returning 200 + `index.html` for a
+missing or private file is indistinguishable from serving it at the status-code level, which
+made the boundary impossible to verify from outside.
+
+Every response carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and
+`Referrer-Policy: no-referrer`, and downloads use `Content-Disposition: attachment`.

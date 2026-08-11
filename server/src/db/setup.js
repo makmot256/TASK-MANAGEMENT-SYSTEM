@@ -4,6 +4,8 @@ import { fileURLToPath } from 'url';
 import mysql from 'mysql2/promise';
 import bcrypt from 'bcryptjs';
 import { env } from '../config/env.js';
+import { applyTriggers } from './triggers.js';
+import { MIGRATIONS } from './migrations.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -40,6 +42,25 @@ async function main() {
   console.log('> Applying schema (modular tables)...');
   const schema = fs.readFileSync(path.join(__dirname, 'schema.sql'), 'utf8');
   await root.query(schema);
+
+  // Triggers live outside schema.sql because that file is executed with
+  // multipleStatements, which splits on the semicolons inside a trigger body.
+  console.log('> Applying triggers...');
+  await applyTriggers(root);
+
+  // A fresh schema.sql install is already at the latest shape, so every
+  // migration is recorded as applied rather than re-run by db:migrate.
+  console.log('> Recording migration ledger...');
+  for (const m of MIGRATIONS) {
+    await root.query(`INSERT IGNORE INTO schema_migrations (id) VALUES (?);`, [m.id]);
+  }
+
+  console.log('> Ensuring an open evaluation cycle...');
+  await root.query(`
+    INSERT INTO evaluation_cycles (name, start_date, end_date, status)
+    SELECT CONCAT('Cycle ', DATE_FORMAT(CURDATE(), '%Y-%m')), CURDATE(), LAST_DAY(CURDATE()), 'open'
+     WHERE NOT EXISTS (SELECT 1 FROM evaluation_cycles WHERE status = 'open');
+  `);
 
   console.log('> Seeding default system settings...');
   for (const [key, value, desc] of DEFAULT_SETTINGS) {

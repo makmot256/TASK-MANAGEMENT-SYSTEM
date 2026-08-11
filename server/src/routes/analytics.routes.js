@@ -4,18 +4,26 @@ import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { asyncHandler, HttpError } from '../middleware/error.js';
 import { getSettings } from '../services/settings.service.js';
-import { computePerformanceForMember } from '../services/performance.service.js';
-import { computeEngagementForMember, recomputeAllEngagement } from '../services/engagement.service.js';
+import { computePerformanceForMember, computePerformanceForMembers } from '../services/performance.service.js';
+import {
+  computeEngagementForMember,
+  computeEngagementForMembers,
+  recomputeAllEngagement,
+} from '../services/engagement.service.js';
 import { recomputeAllPerformance } from '../services/performance.service.js';
 import { markOverduePeerReviews } from '../services/peer-penalty.service.js';
 import { memberIdsForSupervisor, teamIdsForSupervisor } from '../utils/scope.js';
 import {
   listAssignmentsForScope,
   eligibleReviewerPool,
+  retryMissingPeerAssignments,
 } from '../services/peer-assignment.service.js';
 
 const router = Router();
 router.use(authenticate);
+
+const clamp01 = (n) => Math.max(0, Math.min(1, n));
+const round4 = (n) => Math.round((n + Number.EPSILON) * 10000) / 10000;
 
 function riskColor(engagementStatus) {
   // green = on track, amber = moderate, red = high risk
@@ -79,76 +87,165 @@ async function memberTeamMap(memberIds) {
   return map;
 }
 
-async function computeWeeklyForMember(memberId, weekStart, weekEnd, settings) {
-  const [[taskAgg]] = await pool.query(
-    `SELECT COUNT(*) AS completed,
-            SUM(on_time = 1) AS on_time
-       FROM task_assignments
-      WHERE member_id = ?
-        AND status = 'Completed'
-        AND completed_at >= ? AND completed_at < ?`,
-    [memberId, weekStart, weekEnd]
-  );
-  const completed = Number(taskAgg.completed) || 0;
-  const onTime = Number(taskAgg.on_time) || 0;
-  const timeliness = completed > 0 ? onTime / completed : 0;
-  // Relative weekly TP: completion volume capped + timeliness
-  const tp = Math.max(0, Math.min(1, (Math.min(completed, 5) / 5) * (completed ? timeliness || 0.5 : 0)));
+/**
+ * Weekly component scores for many members across many weeks, in four queries.
+ *
+ * P1: this replaces `computeWeeklyForMember`, which issued four queries per
+ * member per week — 20 members x 8 weeks was ~640 sequential round-trips against
+ * a 10-connection pool for a single dashboard load. Latency grew linearly with
+ * team size and a few concurrent supervisors saturated the pool.
+ *
+ * Returns a Map keyed `${memberId}:${weekIndex}`.
+ */
+async function computeWeeklyBatch(memberIds, weekStarts, settings) {
+  const out = new Map();
+  if (!memberIds.length || !weekStarts.length) return out;
 
-  const [[pr]] = await pool.query(
-    `SELECT COALESCE(AVG(score), 0) AS avg_score, COUNT(*) AS n
-       FROM peer_assessments
-      WHERE assessee_id = ? AND kind = 'peer_review'
-        AND created_at >= ? AND created_at < ?`,
-    [memberId, weekStart, weekEnd]
-  );
-  const [[co]] = await pool.query(
-    `SELECT COALESCE(AVG(score), 0) AS avg_score, COUNT(*) AS n
-       FROM peer_assessments
-      WHERE assessee_id = ? AND kind = 'collaboration'
-        AND created_at >= ? AND created_at < ?`,
-    [memberId, weekStart, weekEnd]
-  );
-  const prPart = Number(pr.n) > 0 ? (Number(pr.avg_score) / 5) * 0.5 : 0;
-  const coPart = Number(co.n) > 0 ? (Number(co.avg_score) / 5) * 0.5 : 0;
-  const pe = Math.max(0, Math.min(1, prPart + coPart));
+  const ph = memberIds.map(() => '?').join(',');
+  const rangeStart = weekStarts[0].startStr;
+  const rangeEnd = weekStarts[weekStarts.length - 1].endStr;
 
-  const [[sa]] = await pool.query(
-    `SELECT AVG(quality_score) AS q, AVG(responsiveness_score) AS r, COUNT(*) AS n
-       FROM supervisor_assessments
-      WHERE member_id = ?
-        AND created_at >= ? AND created_at < ?`,
-    [memberId, weekStart, weekEnd]
-  );
-  const saScore =
-    Number(sa.n) > 0
-      ? Math.max(0, Math.min(1, ((Number(sa.q) || 0) + (Number(sa.r) || Number(sa.q) || 0)) / 10))
-      : 0;
-
-  const hasAny = completed > 0 || Number(pr.n) > 0 || Number(co.n) > 0 || Number(sa.n) > 0;
-  const pi = hasAny
-    ? Math.max(
-        0,
-        Math.min(
-          1,
-          Number(settings.pi_weight_tp) * tp +
-            Number(settings.pi_weight_pe) * pe +
-            Number(settings.pi_weight_sa) * saScore
-        )
-      )
-    : null;
-
-  return {
-    tp: Math.round(tp * 10000) / 10000,
-    pe: Math.round(pe * 10000) / 10000,
-    sa: Math.round(saScore * 10000) / 10000,
-    pi: pi == null ? null : Math.round(pi * 10000) / 10000,
-    completed,
-    peer_reviews: Number(pr.n) || 0,
-    collab_reviews: Number(co.n) || 0,
-    assessments: Number(sa.n) || 0,
-    has_data: hasAny,
+  // Maps a timestamp onto its bucket, so one grouped query covers every week.
+  const bucketOf = (value) => {
+    if (!value) return -1;
+    const t = new Date(String(value).replace(' ', 'T') + 'Z').getTime();
+    for (let i = 0; i < weekStarts.length; i += 1) {
+      if (t >= weekStarts[i].startMs && t < weekStarts[i].endMs) return i;
+    }
+    return -1;
   };
+
+  const key = (memberId, week) => `${memberId}:${week}`;
+  const bucket = (memberId, week) => {
+    const k = key(memberId, week);
+    if (!out.has(k)) {
+      out.set(k, {
+        completed: 0, onTime: 0, onTimeKnown: 0,
+        prSum: 0, prN: 0, coSum: 0, coN: 0,
+        qSum: 0, qN: 0, rSum: 0, rN: 0,
+      });
+    }
+    return out.get(k);
+  };
+
+  const [tasks] = await pool.query(
+    `SELECT member_id, completed_at, on_time
+       FROM task_assignments
+      WHERE member_id IN (${ph}) AND status = 'Completed'
+        AND completed_at >= ? AND completed_at < ?`,
+    [...memberIds, rangeStart, rangeEnd]
+  );
+  for (const row of tasks) {
+    const w = bucketOf(row.completed_at);
+    if (w < 0) continue;
+    const b = bucket(row.member_id, w);
+    b.completed += 1;
+    // C3: count how many completions have a KNOWN on_time value, so "nobody was
+    // on time" can be told apart from "we have no timeliness data".
+    if (row.on_time !== null) {
+      b.onTimeKnown += 1;
+      if (Number(row.on_time) === 1) b.onTime += 1;
+    }
+  }
+
+  const [assessments] = await pool.query(
+    `SELECT assessee_id, kind, score, created_at
+       FROM peer_assessments
+      WHERE assessee_id IN (${ph}) AND created_at >= ? AND created_at < ?`,
+    [...memberIds, rangeStart, rangeEnd]
+  );
+  for (const row of assessments) {
+    const w = bucketOf(row.created_at);
+    if (w < 0) continue;
+    const b = bucket(row.assessee_id, w);
+    if (row.kind === 'peer_review') { b.prSum += Number(row.score); b.prN += 1; }
+    else { b.coSum += Number(row.score); b.coN += 1; }
+  }
+
+  const [supervisor] = await pool.query(
+    `SELECT member_id, quality_score, responsiveness_score, created_at
+       FROM supervisor_assessments
+      WHERE member_id IN (${ph}) AND created_at >= ? AND created_at < ?`,
+    [...memberIds, rangeStart, rangeEnd]
+  );
+  for (const row of supervisor) {
+    const w = bucketOf(row.created_at);
+    if (w < 0) continue;
+    const b = bucket(row.member_id, w);
+    b.qSum += Number(row.quality_score); b.qN += 1;
+    if (row.responsiveness_score !== null) { b.rSum += Number(row.responsiveness_score); b.rN += 1; }
+  }
+
+  // Fold the raw counters into scores.
+  const result = new Map();
+  for (const memberId of memberIds) {
+    for (let w = 0; w < weekStarts.length; w += 1) {
+      const b = out.get(key(memberId, w)) || {
+        completed: 0, onTime: 0, onTimeKnown: 0, prSum: 0, prN: 0,
+        coSum: 0, coN: 0, qSum: 0, qN: 0, rSum: 0, rN: 0,
+      };
+
+      // C3: `timeliness || 0.5` was JavaScript falsy coalescing, not a null
+      // check, so a week where the member completed work and NONE of it was on
+      // time scored 0.5 — identical to "no data". The chart could not show a
+      // member missing every deadline. With C2 fixed, on_time is populated on
+      // both completion paths, so unknown is now genuinely rare.
+      let factor;
+      if (b.completed === 0) factor = 0;
+      else if (b.onTimeKnown === 0) factor = 0.5;         // no timeliness data
+      else factor = b.onTime / b.onTimeKnown;             // includes a true 0
+      const tp = clamp01((Math.min(b.completed, 5) / 5) * factor);
+
+      const prPart = b.prN > 0 ? ((b.prSum / b.prN) / 5) * 0.5 : 0;
+      const coPart = b.coN > 0 ? ((b.coSum / b.coN) / 5) * 0.5 : 0;
+      const pe = clamp01(prPart + coPart);
+
+      const avgQ = b.qN > 0 ? b.qSum / b.qN : 0;
+      const avgR = b.rN > 0 ? b.rSum / b.rN : avgQ;
+      const sa = b.qN > 0 ? clamp01((avgQ + avgR) / 10) : 0;
+
+      const hasAny = b.completed > 0 || b.prN > 0 || b.coN > 0 || b.qN > 0;
+      const pi = hasAny
+        ? clamp01(
+            Number(settings.pi_weight_tp) * tp +
+              Number(settings.pi_weight_pe) * pe +
+              Number(settings.pi_weight_sa) * sa
+          )
+        : null;
+
+      result.set(key(memberId, w), {
+        tp: round4(tp),
+        pe: round4(pe),
+        sa: round4(sa),
+        pi: pi == null ? null : round4(pi),
+        completed: b.completed,
+        peer_reviews: b.prN,
+        collab_reviews: b.coN,
+        assessments: b.qN,
+        has_data: hasAny,
+      });
+    }
+  }
+  return result;
+}
+
+/** Week descriptors (Monday-start, UTC) for the last `weeks` weeks. */
+function buildWeeks(weeks) {
+  const thisWeek = weekStartUtc(new Date());
+  const out = [];
+  for (let i = weeks - 1; i >= 0; i -= 1) {
+    const start = addDays(thisWeek, -7 * i);
+    const end = addDays(start, 7);
+    out.push({
+      start,
+      end,
+      startStr: `${fmtYmd(start)} 00:00:00`,
+      endStr: `${fmtYmd(end)} 00:00:00`,
+      startMs: Date.parse(`${fmtYmd(start)}T00:00:00Z`),
+      endMs: Date.parse(`${fmtYmd(end)}T00:00:00Z`),
+    });
+  }
+  return out;
 }
 
 // GET /api/analytics/overview  (supervisor dashboard) -- SRS UC7
@@ -175,18 +272,21 @@ router.get(
     const teamsMeta = await scopedTeams(req);
     const teamMap = await memberTeamMap(memberIds);
 
-    const members = [];
-    for (const m of memberRows) {
-      const perf = await computePerformanceForMember(m.id, settings);
-      const eng = await computeEngagementForMember(m.id, settings);
-      members.push({
+    // P1: two batched calls instead of ~11 sequential queries per member.
+    const [perfMap, engMap] = await Promise.all([
+      computePerformanceForMembers(memberIds, settings),
+      computeEngagementForMembers(memberIds, settings),
+    ]);
+    const members = memberRows.map((m) => {
+      const eng = engMap.get(Number(m.id));
+      return {
         ...m,
         teams: teamMap.get(m.id) || [],
-        performance: perf,
+        performance: perfMap.get(Number(m.id)),
         engagement: eng,
         risk: riskColor(eng.status),
-      });
-    }
+      };
+    });
 
     const withData = members.filter((m) => m.performance);
     const cohort = withData.length
@@ -256,35 +356,28 @@ router.get(
       ids = ids.filter((id) => teamMemberIds.has(id));
     }
 
-    const now = new Date();
-    const thisWeek = weekStartUtc(now);
-    const series = [];
-
-    for (let i = weeks - 1; i >= 0; i -= 1) {
-      const start = addDays(thisWeek, -7 * i);
-      const end = addDays(start, 7);
-      const startStr = `${fmtYmd(start)} 00:00:00`;
-      const endStr = `${fmtYmd(end)} 00:00:00`;
-
-      const memberWeeks = [];
-      for (const id of ids) {
-        const w = await computeWeeklyForMember(id, startStr, endStr, settings);
-        memberWeeks.push({ member_id: id, ...w });
-      }
+    // P1: four queries total, regardless of member count or week count.
+    const weekDefs = buildWeeks(weeks);
+    const batch = await computeWeeklyBatch(ids, weekDefs, settings);
+    const series = weekDefs.map((wk, index) => {
+      const memberWeeks = ids.map((id) => ({
+        member_id: id,
+        ...batch.get(`${id}:${index}`),
+      }));
       const withData = memberWeeks.filter((m) => m.has_data);
-      series.push({
-        week_start: fmtYmd(start),
-        week_end: fmtYmd(addDays(end, -1)),
-        label: `W/c ${fmtYmd(start).slice(5)}`,
+      return {
+        week_start: fmtYmd(wk.start),
+        week_end: fmtYmd(addDays(wk.end, -1)),
+        label: `W/c ${fmtYmd(wk.start).slice(5)}`,
         avg_pi: withData.length ? avg(withData.map((m) => m.pi).filter((v) => v != null)) : 0,
         avg_tp: withData.length ? avg(withData.map((m) => m.tp)) : 0,
         avg_pe: withData.length ? avg(withData.map((m) => m.pe)) : 0,
         avg_sa: withData.length ? avg(withData.map((m) => m.sa)) : 0,
-        completed_tasks: memberWeeks.reduce((s, m) => s + m.completed, 0),
+        completed_tasks: memberWeeks.reduce((sum, m) => sum + m.completed, 0),
         active_members: withData.length,
         members: memberWeeks,
-      });
-    }
+      };
+    });
 
     res.json({
       weeks,
@@ -309,14 +402,19 @@ router.get(
     } else {
       ids = await memberIdsForSupervisor(req.user.id);
     }
-    const alerts = [];
-    for (const id of ids) {
-      const eng = await computeEngagementForMember(id, settings);
-      if (eng.status === 'at_risk') {
-        const [[u]] = await pool.query(`SELECT id, full_name, avatar_color, email FROM users WHERE id = ?`, [id]);
-        alerts.push({ ...u, engagement: eng });
-      }
-    }
+    if (ids.length === 0) return res.json({ alerts: [] });
+
+    // P1: one batched computation plus one user lookup, rather than ~5 queries
+    // per member followed by another query for each one that is flagged.
+    const engMap = await computeEngagementForMembers(ids, settings);
+    const flagged = ids.filter((id) => engMap.get(Number(id))?.status === 'at_risk');
+    if (flagged.length === 0) return res.json({ alerts: [] });
+
+    const [users] = await pool.query(
+      `SELECT id, full_name, avatar_color, email FROM users WHERE id IN (${flagged.map(() => '?').join(',')})`,
+      flagged
+    );
+    const alerts = users.map((u) => ({ ...u, engagement: engMap.get(Number(u.id)) }));
     res.json({ alerts });
   })
 );
@@ -350,28 +448,20 @@ router.get(
     );
 
     // Weekly progress (last 8 weeks)
-    const weeks = 8;
-    const thisWeek = weekStartUtc(new Date());
-    const weekly = [];
-    for (let i = weeks - 1; i >= 0; i -= 1) {
-      const start = addDays(thisWeek, -7 * i);
-      const end = addDays(start, 7);
-      const w = await computeWeeklyForMember(
-        id,
-        `${fmtYmd(start)} 00:00:00`,
-        `${fmtYmd(end)} 00:00:00`,
-        settings
-      );
-      weekly.push({
-        week_start: fmtYmd(start),
-        label: `W/c ${fmtYmd(start).slice(5)}`,
+    const weekDefs = buildWeeks(8);
+    const batch = await computeWeeklyBatch([id], weekDefs, settings);
+    const weekly = weekDefs.map((wk, index) => {
+      const w = batch.get(`${id}:${index}`);
+      return {
+        week_start: fmtYmd(wk.start),
+        label: `W/c ${fmtYmd(wk.start).slice(5)}`,
         ...w,
         PI: w.pi == null ? 0 : Math.round(w.pi * 100),
         TP: Math.round(w.tp * 100),
         PE: Math.round(w.pe * 100),
         SA: Math.round(w.sa * 100),
-      });
-    }
+      };
+    });
 
     const teamMap = await memberTeamMap([id]);
     res.json({
@@ -442,6 +532,85 @@ router.get(
   })
 );
 
+// GET /api/analytics/trend/:id  (PI history from the nightly snapshots)
+//
+// P2: performance_scores was written every night and read by nothing, which
+// invites the assumption that it is authoritative. It now backs the only view
+// live recomputation cannot produce — how a member's PI moved over time.
+router.get(
+  '/trend/:id',
+  asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (req.user.role === 'member' && id !== req.user.id) {
+      throw new HttpError(403, 'You can only view your own trend.');
+    }
+    if (req.user.role === 'supervisor') {
+      const ids = await memberIdsForSupervisor(req.user.id);
+      if (!ids.includes(id)) throw new HttpError(403, 'Not in your scope.');
+    }
+    const days = Math.min(Math.max(Number(req.query.days) || 90, 7), 365);
+
+    // One snapshot per day (the latest), so a manual recompute does not create
+    // several points on the same date.
+    const [snapshots] = await pool.query(
+      `SELECT DATE(ps.computed_at) AS day, ps.tp, ps.pe, ps.sa, ps.pi, ps.timeliness, ps.penalty_applied
+         FROM performance_scores ps
+         JOIN (SELECT DATE(computed_at) d, MAX(computed_at) mx
+                 FROM performance_scores
+                WHERE member_id = ? AND computed_at > (NOW() - INTERVAL ? DAY)
+                GROUP BY DATE(computed_at)) last
+           ON last.mx = ps.computed_at
+        WHERE ps.member_id = ?
+        ORDER BY day ASC`,
+      [id, days, id]
+    );
+    res.json({ member_id: id, days, snapshots });
+  })
+);
+
+// GET /api/analytics/history/:taskId  (status timeline for one task)
+//
+// P2: task_status_history received a row on every transition and was likewise
+// never read. It is the only record of how a task actually progressed.
+router.get(
+  '/history/:taskId',
+  asyncHandler(async (req, res) => {
+    const taskId = Number(req.params.taskId);
+    const [[task]] = await pool.query(`SELECT id, created_by FROM tasks WHERE id = ?`, [taskId]);
+    if (!task) throw new HttpError(404, 'Task not found.');
+
+    if (req.user.role === 'member') {
+      const [[mine]] = await pool.query(
+        `SELECT id FROM task_assignments WHERE task_id = ? AND member_id = ? LIMIT 1`,
+        [taskId, req.user.id]
+      );
+      if (!mine) throw new HttpError(403, 'You are not assigned to this task.');
+    } else if (req.user.role === 'supervisor' && task.created_by !== req.user.id) {
+      const ids = await memberIdsForSupervisor(req.user.id);
+      const [assignees] = await pool.query(
+        `SELECT member_id FROM task_assignments WHERE task_id = ?`,
+        [taskId]
+      );
+      if (!assignees.some((a) => ids.includes(a.member_id))) throw new HttpError(403, 'Not in your scope.');
+    }
+
+    // member_id is denormalised onto the history row, so entries survive their
+    // assignment being deleted and remain attributable.
+    const [history] = await pool.query(
+      `SELECT h.id, h.old_status, h.new_status, h.changed_at,
+              h.member_id, u.full_name AS member_name, u.avatar_color,
+              actor.full_name AS changed_by_name
+         FROM task_status_history h
+         LEFT JOIN users u ON u.id = h.member_id
+         LEFT JOIN users actor ON actor.id = h.changed_by
+        WHERE h.task_id = ?
+        ORDER BY h.changed_at ASC, h.id ASC`,
+      [taskId]
+    );
+    res.json({ task_id: taskId, history });
+  })
+);
+
 // GET /api/analytics/me  (member's own summary card)
 router.get(
   '/me',
@@ -465,9 +634,16 @@ router.post(
   asyncHandler(async (req, res) => {
     const settings = await getSettings();
     const overdue = await markOverduePeerReviews(settings);
+    const retried = await retryMissingPeerAssignments();
     const perf = await recomputeAllPerformance();
     const eng = await recomputeAllEngagement();
-    res.json({ message: 'Analytics recomputed.', missed_reviews_marked: overdue.marked, performance_members: perf, engagement: eng });
+    res.json({
+      message: 'Analytics recomputed.',
+      missed_reviews_marked: overdue.marked,
+      peer_assignments_repaired: retried.repaired,
+      performance_members: perf,
+      engagement: eng,
+    });
   })
 );
 

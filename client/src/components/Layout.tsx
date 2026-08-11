@@ -11,6 +11,37 @@ import {
 
 interface NavDef { to: string; label: string; icon: React.ReactNode; badgeKey?: 'reviewQueue'; }
 
+/**
+ * Runs `fn` immediately and then on an interval, but only while the tab is
+ * visible. On becoming visible again it fires once straight away so the user
+ * never looks at data that went stale while they were elsewhere.
+ */
+function usePolling(fn: () => void, intervalMs: number, deps: unknown[] = []) {
+  const saved = useRef(fn);
+  saved.current = fn;
+
+  useEffect(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const stop = () => { if (timer) { clearInterval(timer); timer = null; } };
+    const start = () => {
+      stop();
+      saved.current();
+      timer = setInterval(() => saved.current(), intervalMs);
+    };
+
+    const onVisibility = () => (document.hidden ? stop() : start());
+
+    if (!document.hidden) start();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [intervalMs, ...deps]);
+}
+
 const NAV: Record<string, NavDef[]> = {
   member: [
     { to: '/', label: 'Dashboard', icon: <IcoDashboard className="nav-ico" /> },
@@ -73,18 +104,12 @@ export default function Layout({ children }: { children: React.ReactNode }) {
     } catch { /* ignore */ }
   };
 
-  useEffect(() => {
-    loadNotifs();
-    const t = setInterval(loadNotifs, 30000);
-    return () => clearInterval(t);
-  }, []);
-
-  useEffect(() => {
-    if (!user) return;
-    loadReviewPending();
-    const t = setInterval(loadReviewPending, 30000);
-    return () => clearInterval(t);
-  }, [user?.id, user?.role]);
+  // P3: two 30-second polls per session used to run whether or not the tab was
+  // visible, so a wall of background tabs kept hitting the API forever. Polling
+  // now pauses while hidden and refreshes immediately on return, which is both
+  // cheaper and more current than a fixed interval.
+  usePolling(loadNotifs, 30000);
+  usePolling(loadReviewPending, 30000, [user?.id, user?.role]);
 
   useEffect(() => {
     if (!profileOpen && !notifOpen) return;

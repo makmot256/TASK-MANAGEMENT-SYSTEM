@@ -1,0 +1,25 @@
+# Keep the build context small and prevent host state leaking into images.
+**/node_modules
+**/dist
+**/build
+.dist
+
+# Secrets — compose injects environment directly.
+.env
+**/.env
+!**/.env.example
+
+# Uploaded files belong in the named volume, never in an image layer.
+server/uploads/*
+!server/uploads/.gitkeep
+
+.git
+.gitignore
+docs
+*.md
+!README.md
+*.log
+.DS_Store
+Dockerfile
+.dockerignore
+docker-compose*.yml

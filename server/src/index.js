@@ -7,7 +7,7 @@ import { env } from './config/env.js';
 import { pool } from './config/db.js';
 import { notFound, errorHandler } from './middleware/error.js';
 import { startScheduler } from './jobs/scheduler.js';
-import { uploadRoot } from './middleware/upload.js';
+import { avatarRoot } from './middleware/upload.js';
 
 import authRoutes from './routes/auth.routes.js';
 import adminRoutes from './routes/admin.routes.js';
@@ -26,11 +26,30 @@ app.use(cors({ origin: env.clientOrigin, credentials: true }));
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// S8: stop browsers guessing a content type for anything we serve, and keep
+// uploaded documents from ever being rendered inline.
+app.use((req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  next();
+});
+
 // Health check
 app.get('/api/health', (req, res) => res.json({ status: 'ok', time: new Date().toISOString() }));
 
-// Uploaded files (avatars, submission attachments)
-app.use('/uploads', express.static(uploadRoot));
+// S1: only the avatar subtree is public. Task briefings and submission
+// attachments stay private and are reachable exclusively through
+// GET /api/tasks/:taskId/files/:fileId and GET /api/submissions/:id/files/:fileId,
+// both of which apply the same scope checks as the records they belong to.
+app.use(
+  '/uploads/avatars',
+  express.static(avatarRoot, {
+    index: false,
+    dotfiles: 'deny',
+    setHeaders: (res) => res.setHeader('Cache-Control', 'public, max-age=86400'),
+  })
+);
 
 // API modules
 app.use('/api/auth', authRoutes);
@@ -48,7 +67,11 @@ const clientDist = path.resolve(__dirname, '../../client/dist');
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
   app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api')) return next();
+    // /uploads must fall through to the 404 handler rather than being answered
+    // with index.html. A missing or non-public upload returning 200 + HTML is
+    // indistinguishable from a served file at the status-code level, which
+    // makes the S1 boundary impossible to test from the outside.
+    if (req.path.startsWith('/api') || req.path.startsWith('/uploads')) return next();
     res.sendFile(path.join(clientDist, 'index.html'));
   });
 }
@@ -64,7 +87,8 @@ async function start() {
     console.error('[db] connection failed:', err.message);
     console.error('  -> Did you run "npm run db:setup" and is MySQL running?');
   }
-  startScheduler();
+  if (env.runScheduler) startScheduler();
+  else console.log('[scheduler] disabled in this process (RUN_SCHEDULER=false).');
   app.listen(env.port, () => console.log(`[api] listening on http://localhost:${env.port}`));
 }
 

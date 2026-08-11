@@ -116,8 +116,8 @@ export async function assignPeerReviewersForSubmission(submissionId, revieweeId,
     const deadlineDays = Math.max(Number(settings.peer_review_deadline_days) || 7, 1);
     await pool.execute(
       `INSERT INTO peer_review_assignments
-        (submission_id, reviewer_id, reviewee_id, kind, status, due_at)
-       VALUES (?, ?, ?, 'peer_review', 'pending', DATE_ADD(NOW(), INTERVAL ? DAY))`,
+        (submission_id, reviewer_id, reviewee_id, status, due_at)
+       VALUES (?, ?, ?, 'pending', DATE_ADD(NOW(), INTERVAL ? DAY))`,
       [submissionId, reviewerId, revieweeId, deadlineDays]
     );
 
@@ -162,7 +162,7 @@ export async function listAssignmentsForScope(memberIds) {
 
   const ph = memberIds.map(() => '?').join(',');
   const [assignments] = await pool.query(
-    `SELECT pa.id, pa.submission_id, pa.kind, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
+    `SELECT pa.id, pa.submission_id, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
             rv.id AS reviewer_id, rv.full_name AS reviewer_name, rv.avatar_color AS reviewer_color,
             re.id AS reviewee_id, re.full_name AS reviewee_name, re.avatar_color AS reviewee_color,
             t.title AS task_title, s.submitted_at AS submission_date
@@ -220,7 +220,7 @@ export async function listAssignmentsForScope(memberIds) {
 export async function memberAssignments(reviewerId) {
   const settings = await getSettings();
   const [rows] = await pool.query(
-    `SELECT pa.id, pa.submission_id, pa.reviewee_id, pa.kind, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
+    `SELECT pa.id, pa.submission_id, pa.reviewee_id, pa.status, pa.assigned_at, pa.due_at, pa.completed_at,
             u.full_name AS reviewee_name, u.avatar_color AS reviewee_color, u.title AS reviewee_title,
             t.title AS task_title, s.submitted_at AS submission_date,
             (SELECT COUNT(*) FROM submission_files f WHERE f.submission_id = s.id) AS file_count,
@@ -266,7 +266,7 @@ export async function markAssignmentCompleted(submissionId, reviewerId) {
 export async function isAssignedForSubmission(submissionId, reviewerId) {
   const [rows] = await pool.query(
     `SELECT id, reviewee_id FROM peer_review_assignments
-      WHERE submission_id = ? AND reviewer_id = ? AND kind = 'peer_review'`,
+      WHERE submission_id = ? AND reviewer_id = ?`,
     [submissionId, reviewerId]
   );
   return rows.length ? rows[0] : null;
@@ -275,4 +275,41 @@ export async function isAssignedForSubmission(submissionId, reviewerId) {
 export async function canViewSubmissionForPeerReview(submissionId, userId) {
   const row = await isAssignedForSubmission(submissionId, userId);
   return !!row;
+}
+
+/**
+ * Retries peer-reviewer assignment for submissions that ended up with none.
+ *
+ * R2: a crash inside assignPeerReviewersForSubmission is caught so the member's
+ * submission still succeeds, but that used to leave a submission which would
+ * never receive peer reviews, with nothing to notice or retry it. The nightly
+ * job now sweeps for them.
+ *
+ * Only looks at recent submissions, so a genuinely empty reviewer pool in the
+ * distant past is not retried forever.
+ */
+export async function retryMissingPeerAssignments({ lookbackDays = 14 } = {}) {
+  const [orphans] = await pool.query(
+    `SELECT s.id, s.member_id, t.title
+       FROM submissions s
+       JOIN tasks t ON t.id = s.task_id
+      WHERE s.submitted_at > (NOW() - INTERVAL ? DAY)
+        AND NOT EXISTS (SELECT 1 FROM peer_review_assignments pa WHERE pa.submission_id = s.id)
+      ORDER BY s.submitted_at DESC
+      LIMIT 200`,
+    [lookbackDays]
+  );
+
+  let repaired = 0;
+  let stillEmpty = 0;
+  for (const sub of orphans) {
+    try {
+      const result = await assignPeerReviewersForSubmission(sub.id, sub.member_id, sub.title);
+      if (Number(result.created) > 0) repaired += 1;
+      else stillEmpty += 1;
+    } catch (err) {
+      console.error(`[peer-assign] retry failed for submission ${sub.id}: ${err.message}`);
+    }
+  }
+  return { examined: orphans.length, repaired, stillEmpty };
 }

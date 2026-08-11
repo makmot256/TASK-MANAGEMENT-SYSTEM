@@ -10,6 +10,7 @@ export interface User {
   phone?: string;
   title?: string;
   status?: string;
+  must_reset?: number | boolean;
   last_login_at?: string;
   created_at?: string;
   teams?: string;

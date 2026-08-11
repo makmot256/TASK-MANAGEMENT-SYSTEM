@@ -152,20 +152,45 @@ async function main() {
   }
 
   console.log('> Creating peer & collaboration assessments...');
-  const [cyc] = await pool.query(`SELECT id FROM evaluation_cycles ORDER BY id DESC LIMIT 1`);
+  // An open cycle is guaranteed by db:setup, but seed may run against a database
+  // whose cycle was closed, so ensure one rather than assuming.
+  await pool.execute(
+    `INSERT INTO evaluation_cycles (name, start_date, end_date, status)
+     SELECT CONCAT('Cycle ', DATE_FORMAT(CURDATE(), '%Y-%m')), CURDATE(), LAST_DAY(CURDATE()), 'open'
+      WHERE NOT EXISTS (SELECT 1 FROM evaluation_cycles WHERE status = 'open')`
+  );
+  const [cyc] = await pool.query(`SELECT id FROM evaluation_cycles WHERE status = 'open' LIMIT 1`);
   const cycleId = cyc[0].id;
+
+  // Peer reviews hang off a real submission, matching exactly what POST /api/peer
+  // writes. The old seed attached them to a cycle with no submission, a shape the
+  // application never produces and chk_assess_parent now rejects.
+  const [subs] = await pool.query(
+    `SELECT s.id, s.member_id FROM submissions s ORDER BY s.id`
+  );
+  for (const sub of subs) {
+    const reviewers = members.filter((m) => m.id !== sub.member_id && m.activity >= 0.4);
+    for (const reviewer of reviewers) {
+      if (Math.random() > 0.4) continue;
+      await pool.execute(
+        `INSERT IGNORE INTO peer_review_assignments (submission_id, reviewer_id, reviewee_id, status, due_at, completed_at)
+         VALUES (?, ?, ?, 'completed', DATE_ADD(NOW(), INTERVAL 7 DAY), NOW())`,
+        [sub.id, reviewer.id, sub.member_id]
+      );
+      await pool.execute(
+        `INSERT IGNORE INTO peer_assessments (submission_id, assessor_id, assessee_id, kind, score, comment, created_at)
+         VALUES (?, ?, ?, 'peer_review', ?, ?, ?)`,
+        [sub.id, reviewer.id, sub.member_id, rand(3, 5),
+         pick(['Helpful contributor.', 'Strong technical work.', 'Reliable teammate.']), daysAgo(rand(1, 10))]
+      );
+    }
+  }
+
+  // Collaboration ratings are cycle-scoped and same-team only.
   for (const assessor of members) {
-    // active members submit peer reviews; low-activity members skip (=> penalty)
     if (assessor.activity < 0.4) continue;
     for (const assessee of members) {
       if (assessee.id === assessor.id) continue;
-      if (Math.random() < 0.5) {
-        await pool.execute(
-          `INSERT IGNORE INTO peer_assessments (cycle_id, assessor_id, assessee_id, kind, score, comment, created_at)
-           VALUES (?, ?, ?, 'peer_review', ?, ?, ?)`,
-          [cycleId, assessor.id, assessee.id, rand(3, 5), pick(['Helpful contributor.', 'Strong technical work.', 'Reliable teammate.']), daysAgo(rand(1, 10))]
-        );
-      }
       if (Math.random() < 0.5) {
         await pool.execute(
           `INSERT IGNORE INTO peer_assessments (cycle_id, assessor_id, assessee_id, kind, score, comment, created_at)

@@ -20,7 +20,17 @@ api.interceptors.response.use(
     const gatewayErr = status === 502 || status === 503 || status === 504;
     const retries = config?.__retryCount ?? 0;
 
-    if (config && retries < 2 && (networkErr || gatewayErr)) {
+    // R1: only replay methods that are safe to replay. A POST that reached the
+    // server and committed, but whose response was lost (proxy restart, dropped
+    // connection, the synthetic 502 the Vite proxy returns while the API
+    // restarts under --watch), used to be retried up to twice — creating
+    // duplicate tasks with duplicate notifications, or duplicate submissions
+    // each triggering their own set of peer review assignments. That restart
+    // window is exactly when this fires, so the risk was not theoretical.
+    const method = (config?.method || 'get').toLowerCase();
+    const idempotent = ['get', 'head', 'options'].includes(method);
+
+    if (config && idempotent && retries < 2 && (networkErr || gatewayErr)) {
       config.__retryCount = retries + 1;
       config.__retry = true;
       await new Promise((r) => setTimeout(r, 800 + retries * 700));

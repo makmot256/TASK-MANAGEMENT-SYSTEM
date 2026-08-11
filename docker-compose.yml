@@ -1,23 +1,188 @@
-# Spins up MySQL 8 for the Task Management System.
-# Usage:  docker compose up -d
-# Matches the defaults in server/.env (root user, empty password, db name).
+# Task Management System — full local stack.
+#
+#   docker compose up -d --build      API + MySQL + Mailpit, schema applied
+#   docker compose logs -f api        follow the API
+#   docker compose down               stop (data survives in named volumes)
+#   docker compose down -v            stop and DESTROY the database + uploads
+#
+# App:      http://localhost:4000
+# Mailpit:  http://localhost:8025   (password-reset and at-risk emails land here)
+#
+# Optional extras:
+#   docker compose --profile tools up adminer     DB browser on :8080
+#   docker compose --profile tools run --rm db-migrate
+#   docker compose --profile split-scheduler up -d scheduler
+#
+# Copy .env.example to .env to override any of the defaults below.
+
+x-app-env: &app-env
+  NODE_ENV: production
+  PORT: "4000"
+  CLIENT_ORIGIN: ${CLIENT_ORIGIN:-http://localhost:4000}
+  DB_HOST: mysql
+  DB_PORT: "3306"
+  DB_USER: root
+  DB_PASSWORD: ${DB_PASSWORD:-tms_local_dev}
+  DB_NAME: ${DB_NAME:-task_management_system}
+  JWT_SECRET: ${JWT_SECRET:-local_dev_secret_not_for_deployment}
+  JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-8h}
+  UPLOAD_DIR: /app/uploads
+  # S9: 25 MB per file is generous for PDF/DOCX. The old 1 GB default let one
+  # member push 10 GB per request onto the disk MySQL shares.
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-25}
+  MAX_UPLOAD_FILES: ${MAX_UPLOAD_FILES:-10}
+  MEMBER_STORAGE_QUOTA_MB: ${MEMBER_STORAGE_QUOTA_MB:-500}
+  SESSION_IDLE_MINUTES: ${SESSION_IDLE_MINUTES:-30}
+  ENGAGEMENT_RISK_THRESHOLD: ${ENGAGEMENT_RISK_THRESHOLD:-40}
+  SCORING_CRON: ${SCORING_CRON:-0 2 * * *}
+  PEER_REVIEWERS_PER_SUBMISSION: ${PEER_REVIEWERS_PER_SUBMISSION:-3}
+  # Mailpit accepts any credentials; the mailer only builds a transport when
+  # both SMTP_HOST and SMTP_USER are non-empty, so SMTP_USER must be set.
+  SMTP_HOST: mailpit
+  SMTP_PORT: "1025"
+  SMTP_USER: tms
+  SMTP_PASS: tms
+  MAIL_FROM: ${MAIL_FROM:-Task Management System <no-reply@tms.local>}
+  SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL:-admin@tms.local}
+  SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-Admin@123}
+
 services:
   mysql:
-    image: mysql:8.0
+    image: mysql:8.0.40
     container_name: tms-mysql
     restart: unless-stopped
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
-      MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
-      MYSQL_DATABASE: task_management_system
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-tms_local_dev}
+      MYSQL_DATABASE: ${DB_NAME:-task_management_system}
     ports:
-      - "3306:3306"
+      # Bound to loopback so the database is not exposed on the network.
+      # Drop this block entirely if you never inspect the DB from the host.
+      - "127.0.0.1:3306:3306"
     volumes:
       - tms_mysql_data:/var/lib/mysql
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${DB_PASSWORD:-tms_local_dev}"]
       interval: 5s
       timeout: 5s
       retries: 20
+      start_period: 20s
+
+  # One-shot: applies schema.sql, seeds system_settings, ensures the admin
+  # account, then exits. Idempotent, so it runs on every `up`. Keeping this as
+  # db/setup.js rather than an entrypoint-initdb mount means there is still a
+  # single source of truth for a fresh install.
+  db-setup:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tms-app
+    container_name: tms-db-setup
+    environment: *app-env
+    command: ["npm", "run", "db:setup"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tms-app
+    container_name: tms-api
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      # Flip to "false" when running the split-scheduler profile, so the
+      # nightly job has exactly one owner.
+      RUN_SCHEDULER: ${RUN_SCHEDULER:-true}
+    ports:
+      - "${API_PORT:-4000}:4000"
+    volumes:
+      - tms_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      db-setup:
+        condition: service_completed_successfully
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    container_name: tms-mailpit
+    restart: unless-stopped
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "8025:8025"
+
+  # --- opt-in services ------------------------------------------------------
+
+  # Dedicated scheduler process. Enable with RUN_SCHEDULER=false on the API.
+  scheduler:
+    profiles: ["split-scheduler"]
+    image: tms-app
+    container_name: tms-scheduler
+    restart: unless-stopped
+    environment:
+      <<: *app-env
+      RUN_SCHEDULER: "true"
+    command: ["npm", "run", "jobs:scheduler"]
+    volumes:
+      - tms_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  # Upgrades an existing database in place. Run manually, never on `up`.
+  db-migrate:
+    profiles: ["tools"]
+    image: tms-app
+    container_name: tms-db-migrate
+    environment: *app-env
+    command: ["npm", "run", "db:migrate"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  # Optional demo dataset (Sarah, David, Grace, Kevin, …).
+  db-seed:
+    profiles: ["tools"]
+    image: tms-app
+    container_name: tms-db-seed
+    environment: *app-env
+    command: ["npm", "run", "db:seed"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  # Runs the node --test suite against a throwaway database on the same server.
+  test:
+    profiles: ["tools"]
+    image: tms-app
+    container_name: tms-test
+    environment:
+      <<: *app-env
+      TEST_DB_NAME: task_management_system_test
+    command: ["npm", "test"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: "no"
+
+  adminer:
+    profiles: ["tools"]
+    image: adminer:4
+    container_name: tms-adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: mysql
+    ports:
+      - "8080:8080"
 
 volumes:
   tms_mysql_data:
+  tms_uploads:

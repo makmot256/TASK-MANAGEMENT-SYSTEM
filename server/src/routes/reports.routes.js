@@ -1,10 +1,11 @@
 import { Router } from 'express';
 import path from 'path';
-import { pool } from '../config/db.js';
+import { pool, withTransaction } from '../config/db.js';
 import { authenticate } from '../middleware/auth.js';
 import { requireRole } from '../middleware/rbac.js';
 import { asyncHandler, HttpError } from '../middleware/error.js';
-import { upload, uploadRoot } from '../middleware/upload.js';
+import { upload, uploadRoot, unlinkUploaded } from '../middleware/upload.js';
+import { env } from '../config/env.js';
 import { notify, logActivity } from '../utils/notify.js';
 import { memberIdsForSupervisor } from '../utils/scope.js';
 import {
@@ -32,44 +33,87 @@ router.post(
        WHERE ta.task_id = ? AND ta.member_id = ? LIMIT 1`,
       [task_id, req.user.id]
     );
-    if (!assign.length) throw new HttpError(403, 'You are not assigned to this task.');
+    if (!assign.length) {
+      await unlinkUploaded(files);
+      throw new HttpError(403, 'You are not assigned to this task.');
+    }
     const a = assign[0];
     const isLate = a.deadline ? (new Date() > new Date(a.deadline) ? 1 : 0) : 0;
 
-    const [result] = await pool.execute(
-      `INSERT INTO submissions (task_id, assignment_id, member_id, content, kind, is_late, revision_of)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [task_id, a.id, req.user.id, content || null, kind === 'daily_log' ? 'daily_log' : 'weekly_report', isLate, revision_of || null]
-    );
-    const submissionId = result.insertId;
-
-    for (const f of files) {
-      await pool.execute(
-        `INSERT INTO submission_files (submission_id, original_name, stored_name, mime_type, size_bytes)
-         VALUES (?, ?, ?, ?, ?)`,
-        [submissionId, f.originalname, f.filename, f.mimetype, f.size]
+    // S9: a per-member ceiling, so uploads cannot fill the disk that MySQL
+    // shares. Checked after multer has written, hence the cleanup on rejection.
+    if (files.length) {
+      const [[usage]] = await pool.query(
+        `SELECT COALESCE(SUM(sf.size_bytes), 0) AS bytes
+           FROM submission_files sf JOIN submissions s ON s.id = sf.submission_id
+          WHERE s.member_id = ?`,
+        [req.user.id]
       );
+      const incoming = files.reduce((sum, f) => sum + Number(f.size || 0), 0);
+      const quota = env.memberStorageQuotaMb * 1024 * 1024;
+      if (Number(usage.bytes) + incoming > quota) {
+        await unlinkUploaded(files);
+        throw new HttpError(
+          413,
+          `Storage quota exceeded. Each member may store up to ${env.memberStorageQuotaMb} MB of attachments.`
+        );
+      }
     }
 
-    // Move assignment to Under Review on submission
-    await pool.execute(`UPDATE task_assignments SET status = 'Under Review' WHERE id = ?`, [a.id]);
+    // D5: one transaction. These four statements used to run independently, so a
+    // failure between them could leave a submission with missing file rows, or an
+    // assignment that never advanced to Under Review.
+    let submissionId;
+    try {
+      submissionId = await withTransaction(async (conn) => {
+        const [result] = await conn.execute(
+          `INSERT INTO submissions (task_id, assignment_id, member_id, content, kind, is_late, revision_of)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [task_id, a.id, req.user.id, content || null, kind === 'daily_log' ? 'daily_log' : 'weekly_report', isLate, revision_of || null]
+        );
+        const id = result.insertId;
+
+        for (const f of files) {
+          await conn.execute(
+            `INSERT INTO submission_files (submission_id, original_name, stored_name, mime_type, size_bytes)
+             VALUES (?, ?, ?, ?, ?)`,
+            [id, f.originalname, f.filename, f.mimetype, f.size]
+          );
+        }
+        await conn.execute(`UPDATE task_assignments SET status = 'Under Review' WHERE id = ?`, [a.id]);
+        return id;
+      });
+    } catch (err) {
+      // D4: multer wrote these before the transaction opened, so a rollback
+      // would otherwise orphan them on disk forever.
+      await unlinkUploaded(files);
+      throw err;
+    }
+
     await logActivity(req.user.id, 'submission', { task_id, submissionId }, null);
 
     // Assign peer reviewers immediately so supervisors can see them right away.
+    // Deliberately outside the transaction and non-fatal: a submission is the
+    // member's work and must survive a reviewer-selection problem.
     let peerAssign = { created: 0, reviewers: [] };
+    let peerAssignFailed = false;
     try {
       peerAssign = await assignPeerReviewersForSubmission(submissionId, req.user.id, a.title);
     } catch (err) {
+      // R2: remember that this ERRORED rather than legitimately finding nobody.
+      // The nightly sweep retries submissions left with no reviewers.
+      peerAssignFailed = true;
       console.error('[peer-assign] submission assignment failed:', err.message);
     }
 
     const reviewerNames = (peerAssign.reviewers || []).map((r) => r.reviewer_name).filter(Boolean);
-    const peerLine =
-      reviewerNames.length > 0
-        ? ` Peer reviewers assigned: ${reviewerNames.join(', ')}.`
-        : peerAssign.created === 0
-          ? ' No peer reviewers were available to assign.'
-          : '';
+    // R2: an empty pool and a crashed selector used to produce the same message,
+    // so a real failure read like an expected outcome.
+    const peerLine = reviewerNames.length > 0
+      ? ` Peer reviewers assigned: ${reviewerNames.join(', ')}.`
+      : peerAssignFailed
+        ? ' Peer reviewer assignment failed and will be retried automatically.'
+        : ' No peer reviewers were available to assign.';
 
     await notify(a.created_by, {
       type: 'report_submitted',
@@ -383,9 +427,26 @@ router.post(
         link: `/reports`,
       });
     } else if (mark_completed) {
+      // C2: this is the normal path for any task that goes through review, and it
+      // used to leave on_time NULL. Task Performance is
+      // (completed / assigned) x (on_time / completed), so such completions
+      // counted in the numerator of the first factor and contributed nothing to
+      // the second — a member who submitted everything early and had it all
+      // approved scored timeliness 0, hence TP 0.
+      //
+      // Judged against the SUBMISSION timestamp, not the approval timestamp: a
+      // member should not be marked late because their supervisor reviewed slowly.
       await pool.execute(
-        `UPDATE task_assignments SET status = 'Completed', completed_at = COALESCE(completed_at, NOW()) WHERE id = ?`,
-        [sub.assignment_id]
+        `UPDATE task_assignments ta
+           JOIN tasks t ON t.id = ta.task_id
+            SET ta.status = 'Completed',
+                ta.completed_at = COALESCE(ta.completed_at, NOW()),
+                ta.on_time = COALESCE(
+                  ta.on_time,
+                  CASE WHEN t.deadline IS NULL OR ? <= t.deadline THEN 1 ELSE 0 END
+                )
+          WHERE ta.id = ?`,
+        [sub.submitted_at, sub.assignment_id]
       );
     }
 
